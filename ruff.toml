@@ -11,6 +11,8 @@ exclude = [
     "jac/jaclang/pycore/lark_ts_parser.py",
     # Examples may contain Python 3.12+ syntax for demonstration
     "jac/examples/",
+    # Benchmark scripts use print() for output
+    "benchmark*.py",
 ]
 
 [lint]
