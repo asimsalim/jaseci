@@ -114,7 +114,17 @@ impl ScaleTieredMemory.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
         }
     }
     if missing_ids and self.l3 {
-        l3_results = self.l3.batch_get(missing_ids);
+        # Use batch_get if L3 supports it (MongoBackend), fall back to get() (SqliteMemory)
+        l3_results: dict[UUID, Anchor] = {};
+        if hasattr(self.l3, 'batch_get') {
+            l3_results = self.l3.batch_get(missing_ids);
+        } else {
+            for mid in missing_ids {
+                if (a := self.l3.get(mid)) {
+                    l3_results[mid] = a;
+                }
+            }
+        }
         for (id, anchor) in l3_results.items() {
             self.__mem__[id] = anchor;
             if self.l2 {
