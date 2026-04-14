@@ -94,6 +94,10 @@ obj ExecutionManager {
         walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
     ) -> dict[str, JsonValue];
 
+    def _spawn_walker_offloaded(
+        walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
+    ) -> dict[str, JsonValue];
+
     async def report_collector(call_state: CallState) -> dict[str, JsonValue];
 }
 
