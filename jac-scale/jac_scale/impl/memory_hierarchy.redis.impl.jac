@@ -22,14 +22,13 @@ impl RedisBackend.postinit -> None {
 
 """Check if Redis is available and connected."""
 impl RedisBackend.is_available -> bool {
-    if 'redis_available' in _process_cache {
-        return _process_cache['redis_available'];
+    if _process_cache.get('redis_available') is True {
+        return True;
     }
     if not self.redis_url {
         self.redis_url = _get_db_config().get('redis_url');
     }
     if not self.redis_url or self.redis_client is None {
-        _process_cache['redis_available'] = False;
         return False;
     }
     try {
@@ -38,7 +37,6 @@ impl RedisBackend.is_available -> bool {
         return True;
     } except Exception as e {
         logger.debug(f"Redis availability check failed: {e}");
-        _process_cache['redis_available'] = False;
         return False;
     }
 }

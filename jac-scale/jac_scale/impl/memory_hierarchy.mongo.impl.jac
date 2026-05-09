@@ -171,14 +171,16 @@ impl MongoBackend.set_memory_ref(mem: dict[UUID, Anchor]) -> None {
 
 """Check if MongoDB is available and connected."""
 impl MongoBackend.is_available -> bool {
-    if 'mongo_available' in _process_cache {
-        return _process_cache['mongo_available'];
+    # Only cache a confirmed True — caching False would prevent later
+    # contexts (e.g. test files that configure MongoDB after others that
+    # don't) from ever reaching MongoDB in the same process.
+    if _process_cache.get('mongo_available') is True {
+        return True;
     }
     if not self.mongo_url {
         self.mongo_url = _get_db_config().get('mongodb_uri');
     }
     if not self.mongo_url or self.client is None {
-        _process_cache['mongo_available'] = False;
         return False;
     }
     try {
@@ -186,11 +188,9 @@ impl MongoBackend.is_available -> bool {
         _process_cache['mongo_available'] = True;
         return True;
     } except ConnectionFailure {
-        _process_cache['mongo_available'] = False;
         return False;
     } except Exception as e {
         logger.debug(f"MongoDB availability check failed: {e}");
-        _process_cache['mongo_available'] = False;
         return False;
     }
 }
