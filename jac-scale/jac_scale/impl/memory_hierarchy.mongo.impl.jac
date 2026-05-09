@@ -583,10 +583,6 @@ impl MongoBackend.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
         for doc in self.collection.find({'_id': {'$in': str_ids}}) {
             if (anchor := self._load_anchor(doc)) {
                 anchor.is_updated = False;
-                stored_hash = doc.get('_hash');
-                if stored_hash is not None {
-                    anchor.hash = stored_hash;
-                }
                 result[UUID(doc['_id'])] = anchor;
             }
         }
