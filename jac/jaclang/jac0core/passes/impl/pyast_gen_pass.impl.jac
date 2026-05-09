@@ -14,11 +14,57 @@ impl PyastGenPass._get_builtin_names(cls: Any) -> set[str] {
     return cls._builtin_names;
 }
 
+"""Read __all__ from typing_ambient.pyi, cached after first access."""
+@classmethod
+impl PyastGenPass._get_ambient_typing_names(cls: Any) -> set[str] {
+    if (cls._ambient_typing_names is not None) {
+        return cls._ambient_typing_names;
+    }
+    import os;
+    import ast as py_ast;
+    stub_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "compiler",
+        "type_system",
+        "typing_ambient.pyi"
+    );
+    try {
+        with open(stub_path, encoding="utf-8") as f {
+            tree = py_ast.parse(f.read());
+        }
+        for node in tree.body {
+            if (
+                isinstance(node, py_ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], py_ast.Name)
+                and node.targets[0].id == "__all__"
+                and isinstance(node.value, (py_ast.List, py_ast.Tuple))
+            ) {
+                names: set[str] = `set();
+                for elt in node.value.elts {
+                    if (
+                        isinstance(elt, py_ast.Constant) and isinstance(elt.value, str)
+                    ) {
+                        names.add(elt.value);
+                    }
+                }
+                cls._ambient_typing_names = names;
+                return names;
+            }
+        }
+    } except (OSError, SyntaxError) {
+        pass;
+    }
+    cls._ambient_typing_names = `set();
+    return cls._ambient_typing_names;
+}
+
 impl PyastGenPass.postinit -> None {
     # Initialize by-postinit fields
     self.debuginfo = {'jac_mods': []};
     self.jaclib_imports = `set();
     self.builtin_imports = `set();
+    self.typing_imports = `set();
     self.child_passes = self._init_child_passes(PyastGenPass);
     self.preamble = [
         self.sync(
@@ -192,6 +238,14 @@ impl PyastGenPass._generate_sv_to_sv_stubs(nd: uni.Import) -> bool {
         if binding is None {
             continue;
         }
+        if binding.kind == 'walker' {
+            parts.append(
+                self._gen_py_sv_walker_stub(
+                    local_name, item_name, module_name, binding, boundary_types
+                )
+            );
+            continue;
+        }
         parts.append(
             self._gen_py_sv_func_stub(
                 local_name, item_name, module_name, binding, boundary_types
@@ -212,8 +266,8 @@ impl PyastGenPass._gen_py_sv_func_stub(
     local_name: str,
     func_name: str,
     module_name: str,
-    binding: object,
-    boundary_types: dict
+    binding: InteropBinding,
+    boundary_types: dict[str, BoundaryTypeInfo]
 ) -> str {
     params = ', '.join(binding.param_names) if binding.param_names else '';
     args_kvs: list[str] = [];
@@ -241,8 +295,96 @@ impl PyastGenPass._gen_py_sv_func_stub(
     return 'def ' + local_name + '(' + params + '):\n    return ' + ret_expr;
 }
 
+"""Build a Python source string for an sv-to-sv walker stub class."""
+impl PyastGenPass._gen_py_sv_walker_stub(
+    local_name: str,
+    walker_name: str,
+    module_name: str,
+    binding: InteropBinding,
+    boundary_types: dict[str, BoundaryTypeInfo]
+) -> str {
+    field_names = list(binding.param_names);
+    field_types = list(binding.param_types);
+    fields_repr_pieces: list[str] = [];
+    for fname in field_names {
+        fields_repr_pieces.append("'" + fname + "'");
+    }
+    fields_repr = '[' + ', '.join(fields_repr_pieces) + ']';
+    boundary_pairs: list[str] = [];
+    for i in range(len(field_names)) {
+        ptype = field_types[i] if i < len(field_types) else '';
+        if (ptype in boundary_types and boundary_types[ptype].kind != "enum") {
+            boundary_pairs.append("'" + field_names[i] + "': " + ptype);
+        }
+    }
+    boundary_map = '{' + ', '.join(boundary_pairs) + '}';
+    args_kvs: list[str] = [];
+    for i in range(len(field_names)) {
+        pname = field_names[i];
+        ptype = field_types[i] if i < len(field_types) else '';
+        if (ptype in boundary_types and boundary_types[ptype].kind != "enum") {
+            args_kvs.append(
+                "'" + pname + "': (" + pname + "._to_wire() if hasattr(" + pname + ", '_to_wire') else " + pname + ")"
+            );
+        } else {
+            args_kvs.append("'" + pname + "': " + pname);
+        }
+    }
+    args_dict = '{' + ', '.join(args_kvs) + '}';
+    init_params = ', '.join(
+        ['cls'] + [field_names[i] + '=None' for i in range(len(field_names))]
+    );
+    lines: list[str] = [];
+    lines.append('class ' + local_name + ':');
+    lines.append('    __jac_fields__ = ' + fields_repr);
+    lines.append('    __jac_walker_name__ = ' + "'" + walker_name + "'");
+    lines.append('    __jac_provider_module__ = ' + "'" + module_name + "'");
+    lines.append('    __jac_boundary_types__ = ' + boundary_map);
+    lines.append('    def __new__(' + init_params + '):');
+    lines.append('        kwargs = ' + args_dict);
+    if field_names {
+        lines.append(
+            '        kwargs = {k: v for k, v in kwargs.items() if v is not None}'
+        );
+    }
+    # Inside a class body, identifiers with 2+ leading underscores get
+    # name-mangled to _<ClassName>__name. Look the runtime up via
+    # `globals()[...]` so the mangled spelling never bites us.
+    lines.append(
+        '        return globals()["__jac_sv_client"].spawn_walker(' + "'" + module_name + "', '" + walker_name + "', kwargs, cls)"
+    );
+    # __new__ already populated the instance via spawn_walker -> _from_wire.
+    # Python still invokes __init__ on a returned cls-instance, so we need a
+    # no-op that swallows whatever kwargs the call site passed.
+    lines.append('    def __init__(self, *args, **kwargs):');
+    lines.append('        pass');
+    lines.append('    def _to_wire(self):');
+    lines.append(
+        '        return {f: getattr(self, f, None) for f in self.__jac_fields__}'
+    );
+    lines.append('    @classmethod');
+    lines.append('    def _from_wire(cls, d):');
+    lines.append('        if d is None:');
+    lines.append('            return None');
+    lines.append('        if isinstance(d, list):');
+    lines.append('            return [cls._from_wire(i) for i in d]');
+    lines.append('        if not isinstance(d, dict):');
+    lines.append('            return d');
+    lines.append('        inst = object.__new__(cls)');
+    lines.append('        for k, v in d.items():');
+    lines.append('            if k in cls.__jac_boundary_types__ and v is not None:');
+    lines.append('                v = cls.__jac_boundary_types__[k]._from_wire(v)');
+    lines.append('            setattr(inst, k, v)');
+    lines.append('        if not hasattr(inst, "reports"):');
+    lines.append('            inst.reports = []');
+    lines.append('        return inst');
+    return '\n'.join(lines);
+}
+
 """Build a Python source string for a boundary type stub class."""
-impl PyastGenPass._gen_py_boundary_stub_class(class_name: str, info: object) -> str {
+impl PyastGenPass._gen_py_boundary_stub_class(
+    class_name: str, info: BoundaryTypeInfo
+) -> str {
     field_names: list[str] = [];
     for f in info.fields {
         field_names.append(f[0]);
@@ -290,7 +432,7 @@ needs_enum)
         and should not be added to builtin_imports.
         """
 impl PyastGenPass.builtin_name(name: str) -> ast3.Name {
-    if (name not in ['Enum']) {
+    if (name not in ['Enum', 'IntEnum', 'StrEnum']) {
         self.builtin_imports.add(name);
     }
     return self.sync(ast3.Name(id=name, ctx=ast3.Load()));
@@ -313,14 +455,28 @@ impl PyastGenPass.needs_typing -> None {
     );
 }
 
-"""Ensure Enum utilities are imported only once."""
+"""Ensure plain `Enum` and `auto` are imported (compat shim for callers
+predating typed-base enums; new callers should use needs_enum_kind)."""
 impl PyastGenPass.needs_enum -> None {
+    self.needs_enum_kind("Enum");
+}
+
+"""Ensure a specific enum kind (Enum, IntEnum, StrEnum, ...) is imported once.
+
+Each kind is imported under its own dedup key so a module that uses both
+`enum X { ... }` and `enum Y: int { ... }` ends up with two import lines
+(`from enum import Enum, auto` and `from enum import IntEnum`) rather than
+a fragile combined one. `auto` is always imported alongside the requested
+kind because enum bodies may reference `auto()` regardless of which Enum
+flavor wraps them.
+"""
+impl PyastGenPass.needs_enum_kind(kind: str) -> None {
     self._add_preamble_once(
-        self.needs_enum.__name__,
+        f"needs_enum_kind:{kind}",
         ast3.ImportFrom(
             module='enum',
             names=[
-                self.sync(ast3.alias(name='Enum', asname=None)),
+                self.sync(ast3.alias(name=kind, asname=None)),
                 self.sync(ast3.alias(name='auto', asname=None))
             ],
             level=0
@@ -372,8 +528,6 @@ impl PyastGenPass._function_expr_from_def(
     self._hoisted_funcs.append(func_def);
     return self.sync(ast3.Name(id=func_def.name, ctx=ast3.Load()), jac_node=jac_node);
 }
-
-impl PyastGenPass.get_weather(city: str) { }
 
 """Create a semstring decorator for the given semantic strings.
 
@@ -676,151 +830,11 @@ impl PyastGenPass.exit_sub_tag(nd: uni.SubTag[uni.T]) -> None {
     nd.gen.py_ast = nd.tag.gen.py_ast;
 }
 
-"""Check if a name usage is in a type annotation context (type_tag or return_type)."""
-impl PyastGenPass._is_type_annotation_use(nd: uni.UniNode) -> bool {
-    child = nd;
-    current = nd.parent;
-    while (current is not None) {
-        if (
-            isinstance(current, uni.SubTag)
-            and isinstance(current.parent, uni.AstTypedVarNode)
-            and current.parent.type_tag is current
-        ) {
-            return True;
-        }
-        if (isinstance(current, uni.FuncSignature) and current.return_type is child) {
-            return True;
-        }
-        child = current;
-        current = current.parent;
-    }
-    return False;
-}
-
-"""Check if an import has a # jac:runtime comment annotation on the same line."""
-impl PyastGenPass._has_runtime_annotation(nd: uni.Module, imp: uni.Import) -> bool {
-    if (not nd.source or not imp.loc) {
-        return False;
-    }
-    imp_line = imp.loc.first_line;
-    for comment in nd.source.comments {
-        if (comment.line_no == imp_line and 'jac:runtime' in comment.value) {
-            return True;
-        }
-    }
-    return False;
-}
-
-"""Classify import items and separate type-only imports for TYPE_CHECKING wrapping."""
-impl PyastGenPass._process_type_only_imports(
-    nd: uni.Module, merged_body: list
-) -> tuple[(list, list[ast3.AST])] {
-    filtered_body: list = [];
-    type_only_py_nodes: list[ast3.AST] = [];
-    for item in merged_body {
-        if not isinstance(item, uni.Import) {
-            filtered_body.append(item);
-            continue;
-        }
-        imp: uni.Import = item;
-        # Skip absorb imports and plain imports (not from-imports)
-        if (imp.is_absorb or not imp.from_loc) {
-            filtered_body.append(item);
-            continue;
-        }
-        # Skip __future__ imports (already handled in preamble)
-        if imp.from_loc.path {
-            module_parts = [
-                p.value
-                for p in imp.from_loc.path
-                if p?.value
-            ];
-            if (module_parts == ['__future__']) {
-                filtered_body.append(item);
-                continue;
-            }
-        }
-        # Skip imports annotated with # jac:runtime
-        if self._has_runtime_annotation(nd, imp) {
-            filtered_body.append(item);
-            continue;
-        }
-        # Classify each ModuleItem as type-only or runtime
-        type_only_items: list[uni.ModuleItem] = [];
-        runtime_items: list[uni.ModuleItem] = [];
-        for mi in imp.items {
-            if not isinstance(mi, uni.ModuleItem) {
-                runtime_items.append(mi);
-                continue;
-            }
-            sym_node = mi.alias or mi.name;
-            sym: (uni.Symbol | None) = None;
-            if isinstance(sym_node, uni.NameAtom) {
-                sym = sym_node.sym;
-            }
-            if (sym is not None and sym.imported and len(sym.uses) > 0) {
-                all_type_only = True;
-                for use_nd in sym.uses {
-                    if not self._is_type_annotation_use(use_nd) {
-                        all_type_only = False;
-                        break;
-                    }
-                }
-                if all_type_only {
-                    type_only_items.append(mi);
-                } else {
-                    runtime_items.append(mi);
-                }
-            } else {
-                runtime_items.append(mi);
-            }
-        }
-        if (not type_only_items) {
-            # All runtime - keep as-is
-            filtered_body.append(item);
-        } elif (not runtime_items) {
-            # All type-only - move entirely to TYPE_CHECKING
-            type_only_py_nodes.extend(imp.gen.py_ast);
-        } else {
-            # Mixed - split into two ImportFrom statements
-            module_name_parts = [p.value for p in imp.from_loc.path]
-                if imp.from_loc.path
-                else [];
-            module_name = '.'.join(module_name_parts) if module_name_parts else None;
-            # Runtime import stays in body
-            runtime_import = self.sync(
-                ast3.ImportFrom(
-                    module=module_name,
-                    names=[
-                        cast(ast3.alias, i) for ri in runtime_items
-                        for i in ri.gen.py_ast
-                    ],
-                    level=imp.from_loc.level
-                )
-            );
-            imp.gen.py_ast = [runtime_import];
-            filtered_body.append(item);
-            # Type-only import goes to TYPE_CHECKING
-            type_only_import = self.sync(
-                ast3.ImportFrom(
-                    module=module_name,
-                    names=[
-                        cast(ast3.alias, i) for ti in type_only_items
-                        for i in ti.gen.py_ast
-                    ],
-                    level=imp.from_loc.level
-                )
-            );
-            type_only_py_nodes.append(type_only_import);
-        }
-    }
-    return (filtered_body, type_only_py_nodes);
-}
-
 impl PyastGenPass.exit_module(nd: uni.Module) -> None {
     for child_pass in self.child_passes {
         self.jaclib_imports.update(child_pass.jaclib_imports);
         self.builtin_imports.update(child_pass.builtin_imports);
+        self.typing_imports.update(child_pass.typing_imports);
     }
     is_builtin_module = (
         nd.loc.mod_path.endswith(('builtin.jac', 'builtin.py'))
@@ -834,6 +848,21 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
                     names=[
                         self.sync(ast3.alias(name=name, asname=None))
                         for name in sorted(self.builtin_imports)
+                    ],
+                    level=0
+                ),
+                jac_node=self.ir_out
+            )
+        );
+    }
+    if self.typing_imports {
+        self.preamble.append(
+            self.sync(
+                ast3.ImportFrom(
+                    module='typing',
+                    names=[
+                        self.sync(ast3.alias(name=name, asname=None))
+                        for name in sorted(self.typing_imports)
                     ],
                     level=0
                 ),
@@ -859,28 +888,6 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
         );
     }
     merged_body = self._merge_module_bodies(nd);
-    # Separate type-only imports into TYPE_CHECKING block
-    _tc_result = self._process_type_only_imports(nd, merged_body);
-    filtered_body = _tc_result[0];
-    type_only_py_nodes: list[ast3.AST] = _tc_result[1];
-    if type_only_py_nodes {
-        self.needs_typing();
-        tc_block = self.sync(
-            ast3.If(
-                test=self.sync(
-                    ast3.Attribute(
-                        value=self.sync(ast3.Name(id='typing', ctx=ast3.Load())),
-                        attr='TYPE_CHECKING',
-                        ctx=ast3.Load()
-                    )
-                ),
-                body=[cast(ast3.stmt, n) for n in type_only_py_nodes],
-                orelse=[]
-            ),
-            jac_node=self.ir_out
-        );
-        self.preamble.append(tc_block);
-    }
     body_items: list[ast3.AST | list[ast3.AST] | None] = [];
     if nd.doc {
         doc_stmt = self.sync(
@@ -889,7 +896,7 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
         body_items.append(doc_stmt);
     }
     body_items.extend(self.preamble);
-    body_items.extend(item.gen.py_ast for item in filtered_body);
+    body_items.extend(item.gen.py_ast for item in merged_body);
     new_body = self._flatten_ast_list(body_items);
     nd.gen.py_ast = [
         self.sync(
@@ -1083,11 +1090,12 @@ impl PyastGenPass.exit_import(nd: uni.Import) -> None {
     # Only triggered when the user explicitly wrote `sv import from ...`
     # (we detect this via the sv token, not code_context which defaults
     # to SERVER for all nodes).
+    src_token = nd._source_context_token();
     if (
         nd.from_loc
         and nd.items
-        and nd._source_context_token() is not None
-        and nd._source_context_token().name == Tok.KW_SERVER
+        and src_token is not None
+        and src_token.name == Tok.KW_SERVER
         and self._generate_sv_to_sv_stubs(nd)
     ) {
         return;
@@ -1264,7 +1272,6 @@ impl PyastGenPass.enter_enum(nd: uni.Enum) -> None {
 }
 
 impl PyastGenPass.exit_enum(nd: uni.Enum) -> None {
-    self.needs_enum();
     inner: Sequence[uni.CodeBlockStmt] | Sequence[uni.EnumBlockStmt] | None = None;
     if isinstance(nd.body, uni.ImplDef) {
         inner = nd.body.body if not isinstance(nd.body.body, uni.Expr) else None;
@@ -1278,8 +1285,26 @@ impl PyastGenPass.exit_enum(nd: uni.Enum) -> None {
     if (sem_decorator := self._get_sem_decorator(nd)) {
         decorators.append(sem_decorator);
     }
-    base_classes = [cast(ast3.expr, self.py_ast_val(i)) for i in nd.base_classes];
-    base_classes.append(self.builtin_name('Enum'));
+    # Resolve typed-base shorthand `enum X: T`. `int` and `str` map to the
+    # idiomatic `IntEnum` / `StrEnum` shortcut classes; anything else uses
+    # the Python mixin pattern `class X(T, Enum)` so members are instances
+    # of T (no `.value` needed at call sites).
+    trailing_kind: str = "Enum";
+    extra_bases: list = [];
+    if nd.value_type {
+        if isinstance(nd.value_type, uni.Name) and nd.value_type.value == "int" {
+            trailing_kind = "IntEnum";
+        } elif isinstance(nd.value_type, uni.Name) and nd.value_type.value == "str" {
+            trailing_kind = "StrEnum";
+        } else {
+            extra_bases.append(self.py_ast_val(nd.value_type));
+        }
+    }
+    self.needs_enum_kind(trailing_kind);
+    base_classes = extra_bases + [
+        cast(ast3.expr, self.py_ast_val(i)) for i in nd.base_classes
+    ];
+    base_classes.append(self.builtin_name(trailing_kind));
     class_def = self.sync(
         ast3.ClassDef(
             name=nd.name.sym_name,
@@ -3191,6 +3216,17 @@ impl PyastGenPass.exit_func_call(nd: uni.FuncCall) -> None {
     if nd.genai_call {
         self.ice('Type(by llm()) call feature is temporarily disabled.');
     } else {
+        # Deprecated `root()` form: bare `root` already lowers to Jac.root() in
+        # exit_special_var_ref, so wrapping it in another call would produce
+        # `Jac.root()()` (a Root instance called as a function). The W0062
+        # diagnostic for this is emitted by the type evaluator; here we just
+        # reuse the inner lowering so codegen stays correct.
+        if isinstance(nd.target, uni.SpecialVarRef)
+        and nd.target.name == Tok.KW_ROOT
+        and (nd.params is None or len(nd.params) == 0) {
+            nd.gen.py_ast = nd.target.gen.py_ast;
+            return;
+        }
         # TODO: Primitive emitter dispatch hook.
         # When type information is available, primitive method calls
         # (e.g., mylist.append(x), s.upper()) and builtin function calls
@@ -3274,6 +3310,10 @@ impl PyastGenPass.exit_special_var_ref(nd: uni.SpecialVarRef) -> None {
                     keywords=[]
                 )
             )
+        ];
+    } elif (nd.name == Tok.KW_ROOT) {
+        nd.gen.py_ast = [
+            self.sync(ast3.Call(func=self.jaclib_obj('root'), args=[], keywords=[]))
         ];
     } else {
         nd.gen.py_ast = [
@@ -3668,21 +3708,11 @@ impl PyastGenPass.exit_name(nd: uni.Name) -> None {
             return;
         }
     }
-    if (name == "root" and nd.py_ctx_func == ast3.Load and nd.sym is None) {
-        is_root_call = isinstance(nd.parent, uni.FuncCall) and nd.parent.target is nd;
-        if not is_root_call {
-            # Bare `root` usage — emit deprecation, compile as root() call
-            self.emit(W0062, node_override=nd);
-            nd.gen.py_ast = [
-                self.sync(ast3.Call(func=self.jaclib_obj('root'), args=[], keywords=[]))
-            ];
-            return;
-        }
-        # Explicit root() call — just resolve the name from jaclib
-        self.jaclib_imports.add('root');
-    }
     if (name in self._get_builtin_names()) {
         self.builtin_imports.add(name);
+    }
+    if (name in self._get_ambient_typing_names()) {
+        self.typing_imports.add(name);
     }
     nd.gen.py_ast = [self.sync(ast3.Name(id=name, ctx=nd.py_ctx_func()))];
 }

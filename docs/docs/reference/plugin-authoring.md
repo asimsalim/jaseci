@@ -229,8 +229,8 @@ When `cancel_execution` is `True`, the executor skips the handler and returns im
 | Member | Type | Purpose |
 |---|---|---|
 | `command_name` | `str` | The command being executed (e.g., `"run"`). |
-| `args` | `dict[str, Any]` | Parsed CLI arguments -- a copy, so mutating is safe. |
-| `data` | `dict[str, Any]` | Hook-to-hook scratch space. |
+| `args` | `dict[str, any]` | Parsed CLI arguments -- a copy, so mutating is safe. |
+| `data` | `dict[str, any]` | Hook-to-hook scratch space. |
 | `get_arg(name, default=None)` | method | Read a parsed argument. |
 | `set_data(key, value)` | method | Write to the scratch dict (for cancel keys, hook chaining, etc.). |
 | `get_data(key, default=None)` | method | Read from the scratch dict. |
@@ -262,7 +262,7 @@ The most commonly overridden hooks:
 | `store` | `(base_path='./storage', create_dirs=True) -> Storage` | The graph/object storage backend. Default: `LocalStorage`. jac-scale returns S3/GCS/Azure backends from `[plugins.scale]` config. |
 | `get_console` | `() -> ConsoleImpl` | The console used for all CLI output. jac-super returns a Rich-backed implementation with colors, panels, and spinners. |
 | `get_client_bundle_builder` | `() -> ClientBundleBuilder` | The bundler used to compile `.cl.jac` modules to JS. jac-client returns a Vite-backed builder. |
-| `render_page` | `(introspector, function_name, args, username) -> dict[str, Any]` | Server-side rendering of client components. jac-client implements full SSR. |
+| `render_page` | `(introspector, function_name, args, username) -> dict[str, any]` | Server-side rendering of client components. jac-client implements full SSR. |
 | `format_build_error` | `(error_output: str, project_dir: Path, config) -> str` | Pretty error messages for client build failures. |
 | `ensure_sv_service` | `(module_name: str, base_path: str) -> None` | Lazy spawn an `sv import`-ed microservice provider when `sv_client.call()` first needs it. |
 | `get_mtir`, `call_llm`, `by`, `by_operator` | various | Hooks the byllm plugin uses to implement the `by llm()` language feature. |
@@ -276,7 +276,6 @@ The full list and signatures live in [jac/jaclang/jac0core/runtime.jac:861-888](
 ```jac
 import from jaclang.cli.console { JacConsole }
 import from jaclang.jac0core.runtime { hookimpl }
-import from typing { Any }
 import datetime;
 
 """Console wrapper that prefixes every line with a timestamp."""
@@ -286,7 +285,7 @@ obj TimestampConsole(JacConsole) {
     def init(wrapped: JacConsole) -> None {
         self._wrapped = wrapped;
     }
-    def print(*args: Any, **kwargs: Any) -> None {
+    def print(*args: any, **kwargs: any) -> None {
         ts = datetime.datetime.now().strftime("%H:%M:%S");
         self._wrapped.print(f"[{ts}]", *args, **kwargs);
     }
@@ -325,13 +324,12 @@ If your plugin reads configuration from the user's `jac.toml`, declare a config 
 
 ```jac
 import from jaclang.jac0core.runtime { hookimpl }
-import from typing { Any }
 
 """Plugin config for jac-myplugin."""
 class JacMypluginPluginConfig {
     """Plugin metadata for `jac plugins info`."""
     @hookimpl
-    static def get_plugin_metadata -> dict[str, Any] {
+    static def get_plugin_metadata -> dict[str, any] {
         return {
             "name": "myplugin",
             "version": "0.1.0",
@@ -341,7 +339,7 @@ class JacMypluginPluginConfig {
 
     """Schema for the [plugins.myplugin] section of jac.toml."""
     @hookimpl
-    static def get_config_schema -> dict[str, Any] {
+    static def get_config_schema -> dict[str, any] {
         return {
             "section": "myplugin",
             "options": {
@@ -368,7 +366,7 @@ class JacMypluginPluginConfig {
 
     """Validate the loaded config and return a list of error messages."""
     @hookimpl
-    static def validate_config(config: dict[str, Any]) -> list[str] {
+    static def validate_config(config: dict[str, any]) -> list[str] {
         errors: list[str] = [];
         retries = config.get("max_retries", 3);
         if retries < 0 {
@@ -430,7 +428,7 @@ class JacMypluginPluginConfig {
 
     """Register a 'starter' template for `jac create --use starter`."""
     @hookimpl
-    static def register_project_template -> dict[str, Any] | None {
+    static def register_project_template -> dict[str, any] | None {
         return {
             "name": "starter",
             "description": "Minimal starter project for jac-myplugin",
@@ -457,7 +455,7 @@ class JacMypluginPluginConfig {
 }
 
 """Post-create hook called after the template is scaffolded on disk."""
-def _post_create_starter(project_path: Any, project_name: str) -> None {
+def _post_create_starter(project_path: any, project_name: str) -> None {
     # Run `npm install`, copy assets, anything else.
     return;
 }
@@ -487,7 +485,7 @@ class JacMypluginPluginConfig {
 
     """Register a 'cargo' dependency type for Rust crates."""
     @hookimpl
-    static def register_dependency_type -> dict[str, Any] | None {
+    static def register_dependency_type -> dict[str, any] | None {
         return {
             "name": "cargo",
             "dev_name": "cargo.dev",
@@ -514,6 +512,56 @@ def _cargo_remove(packages: list[str], dev: bool, install_dir: str) -> int {
 This adds a `[dependencies.cargo]` section to `jac.toml`, a `--cargo` flag to `jac add` and `jac remove`, and routes installation through your handlers when `jac install` runs.
 
 **Real reference**: [jac-client's npm dependency type](https://github.com/Jaseci-Labs/jaseci/blob/main/jac-client/jac_client/plugin/plugin_config.jac#L106-L117) is the only dependency type currently in the monorepo. Its handlers shell out to `bun` (or `npm` if Bun isn't available) to manage the project's frontend packages.
+
+### Recipe 7: Custom persistence backends
+
+Backends that store the object-spatial graph (the L3 tier in the memory hierarchy) implement `jaclang.runtimelib.memory.PersistentMemory`. Implementing the interface gives your backend the full Layer 1+2+3 feature set automatically -- schema fingerprints, drift detection, quarantine-on-failure, alias-based class rename resolution -- and makes [`jac db`](cli/index.md#database-operations) work against it with no CLI changes.
+
+The interface has two groups of methods:
+
+```jac
+obj PersistentMemory(Memory) {
+    # Storage primitives (existing).
+    def sync -> None abs;
+    def bulk_put(anchors: Iterable[Anchor]) -> None abs;
+
+    # Layer 1+2+3 operator surface.
+    def inspect_summary -> dict abs;
+    def list_quarantined(limit: int = 50) -> list abs;
+    def show_quarantined(id_prefix: str) -> (dict | None) abs;
+    def recover_one(id_prefix: str) -> tuple abs;          # (ok, reason)
+    def recover_all -> tuple abs;                           # (n_recovered, [(id, reason)])
+    def list_aliases -> list abs;
+    def add_alias(old_name: str, new_name: str) -> None abs;
+    def remove_alias(old_name: str) -> bool abs;
+}
+```
+
+**What each method must do.** See [Persistence & Schema Migration](persistence.md) for the full conceptual model. The contract per method:
+
+| Method | Returns / Effect |
+|---|---|
+| `inspect_summary` | `dict` with keys `format_version`, `anchors_total`, `anchors_by_type` (list of `(name, count)`), `quarantine_total`, `quarantine_by_type`, `aliases_total`, `location` (URI / path for display) |
+| `list_quarantined(limit)` | List of `{'id', 'arch', 'fingerprint', 'error', 'quarantined_at'}` dicts, newest-first |
+| `show_quarantined(id_prefix)` | Full row dict with `data` parsed; `None` if no match; `{'error': 'ambiguous', 'count': N}` if prefix is non-unique |
+| `recover_one(id_prefix)` | `(True, 'recovered')` on success, else `(False, reason)`. Re-stamp the recovered row with the live class's identity + fingerprint so subsequent reads bypass alias resolution |
+| `recover_all` | `(n_recovered: int, still_stuck: list[(id, reason)])` |
+| `list_aliases` | List of `{'old_name', 'new_name', 'created_at'}` dicts |
+| `add_alias(old, new)` | Persist the mapping AND merge into `Serializer._aliases` so it applies on the next read |
+| `remove_alias(old)` | `True` if an entry was deleted; also `pop` from `Serializer._aliases` |
+
+**Required guarantees:**
+
+- **Quarantine, never delete.** When `get` / `_load_anchor` (or whatever your read path is) hits a deserialization failure or unresolvable archetype class, move the row to a quarantine sidecar with the original payload and an error message. Never silently drop.
+- **Stamp every persisted row** with `arch_module`, `arch_type`, `fingerprint`, and `format_version` so drift detection works. The fingerprint comes from `cls.__jac_fingerprint__`.
+- **Load DB-resident aliases at connect time** into `Serializer._aliases` so operator-driven rescues apply on the next read.
+
+**Reference implementations:**
+
+- `jac/jaclang/runtimelib/impl/memory.impl.jac` -- `SqliteMemory`. The simplest backend; uses three tables (`anchors`, `anchors_quarantine`, `aliases`).
+- `jac-scale/jac_scale/impl/memory_hierarchy.mongo.impl.jac` -- `MongoBackend`. Document-store version; uses a main collection plus `<collection>_quarantine` and `<collection>_aliases` sidecars. Worth reading alongside SqliteMemory to see the same contract expressed against a different storage shape.
+
+Once your backend implements the interface, users get `jac db inspect`, `jac db quarantine list/show`, `jac db alias add/list/remove`, and `jac db recover/recover-all` against it for free. No CLI registration required -- `jac db` discovers your backend through the runtime context (`ctx.mem.l3`) at command time.
 
 ## API reference
 
@@ -568,10 +616,10 @@ A command-line argument descriptor. Construct via `Arg.create(name, ...)`.
 | `name` | `str` | Argument name (becomes the parameter name on the handler function). |
 | `kind` | `ArgKind` | `POSITIONAL`, `OPTION` (default -- `--name VALUE`), `FLAG` (`--name`, no value), `MULTI` (collects multiple values), or `REMAINDER` (everything after `--`). |
 | `typ` | `type` | Python type for conversion (`str`, `int`, `float`, `bool`, …). |
-| `default` | `Any` | Default value if the user doesn't pass the flag. |
+| `default` | `any` | Default value if the user doesn't pass the flag. |
 | `help` | `str` | Help text for the argument. |
 | `short` | `str \| None` | Short flag (e.g., `"f"` for `-f`). Pass `""` to disable the auto-generated short flag. |
-| `choices` | `list[Any] \| None` | Restricted set of valid values (argparse `choices`). |
+| `choices` | `list[any] \| None` | Restricted set of valid values (argparse `choices`). |
 | `required` | `bool` | Whether the argument is required. |
 | `metavar` | `str \| None` | Display name in `--help`. |
 
@@ -584,8 +632,8 @@ Mutable context passed to pre and post hooks.
 | Field / method | Type | Purpose |
 |---|---|---|
 | `command_name` | `str` | The name of the command currently executing. |
-| `args` | `dict[str, Any]` | A copy of the parsed CLI arguments. Mutating is safe but does not change what the handler sees -- for that, use `set_data` and have the handler read it back. |
-| `data` | `dict[str, Any]` | Hook-to-hook scratch space. Persists across pre-hook → handler → post-hook. |
+| `args` | `dict[str, any]` | A copy of the parsed CLI arguments. Mutating is safe but does not change what the handler sees -- for that, use `set_data` and have the handler read it back. |
+| `data` | `dict[str, any]` | Hook-to-hook scratch space. Persists across pre-hook → handler → post-hook. |
 | `get_arg(name, default=None)` | method | Read an argument by name. |
 | `set_data(key, value)` | method | Write to the scratch dict. |
 | `get_data(key, default=None)` | method | Read from the scratch dict. |
@@ -648,9 +696,9 @@ A condensed list of every hook plugins can override. The full definitions are in
 | Hook | Signature |
 |---|---|
 | `get_mtir` | `(caller, args, call_params) -> MTRuntime` |
-| `call_llm` | `(model, mt_run) -> Any` |
+| `call_llm` | `(model, mt_run) -> any` |
 | `by` | `(model) -> Callable` |
-| `by_operator` | `(lhs, rhs) -> Any` |
+| `by_operator` | `(lhs, rhs) -> any` |
 | `filter_visitable_by` | `(connected_nodes, model, descriptions: str = "") -> list` |
 
 **CLI (`JacCmd` mixin):**

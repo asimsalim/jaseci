@@ -57,8 +57,11 @@ jac plugins enable scale
 
 ### Basic Server
 
+!!! note
+    `main.jac` is the default entry point. If your entry point has a different name (e.g., `app.jac`), pass it explicitly: `jac start app.jac`.
+
 ```bash
-jac start app.jac
+jac start
 ```
 
 ### Server Options
@@ -84,24 +87,35 @@ jac start app.jac
 
 ```bash
 # Custom port
-jac start app.jac --port 3000
+jac start --port 3000
 
 # Development with HMR (requires jac-client)
-jac start app.jac --dev
+jac start --dev
 
 # API only -- skip client bundling
-jac start app.jac --dev --no_client
+jac start --dev --no_client
 
 # Preview generated API endpoints without starting
-jac start app.jac --faux
+jac start --faux
 
 # Production with profile
-jac start app.jac --port 8000 --profile prod
+jac start --port 8000 --profile prod
 ```
 
 ### Default Persistence
 
 When running locally (without `--scale`), Jac uses **SQLite** for graph persistence by default. You'll see `"Using SQLite for persistence"` in the server output. No external database setup is required for development.
+
+When `MONGODB_URI` is set (or `--scale` provisions Mongo on Kubernetes), persistence flips to `MongoBackend`. The MongoDB backend has full Layer 1+2+3 schema-migration support: every persisted document is stamped with `arch_module`, `arch_type`, `fingerprint`, and `format_version`; documents that can't be deserialized (un-resolvable archetype class, corrupt data, deserialize exception) are moved to a `<collection>_quarantine` companion collection instead of being silently dropped; and DB-resident class-rename aliases live in `<collection>_aliases` and are merged into the in-process Serializer registry on every connect. The same `jac db inspect / quarantine / alias / recover` operator commands work against Mongo deployments unchanged -- see [CLI → Database Operations](../cli/index.md#database-operations) and [Persistence & Schema Migration](../persistence.md) for the full model.
+
+```bash
+# Inspect a live Mongo-backed deployment.
+jac db inspect --app app.jac
+
+# Operator rescue: register a class-rename alias in production without redeploying.
+jac db alias add "old.module.LegacyName" "new.module.NewName" --app app.jac
+jac db recover-all --app app.jac
+```
 
 ### Server Configuration
 
@@ -299,29 +313,194 @@ See the [Webhooks](#webhooks) section below.
 
 ## Authentication
 
+jac-scale uses an **identity-based authentication system**. Each user can sign in through multiple identities (username, email, or an SSO provider like Google or GitHub), and all of them resolve to the same account.
+
+### Identity Model
+
+A user document has this shape:
+
+```
+user_id        UUID (primary key)
+status         "active" | "disabled"
+role           "admin" | "system" | "user"
+identities     [{type, value_raw, value_normalized, verified, is_recovery}, ...]
+credentials    [{type, password_hash}, ...]
+root_id        hex ID of the user's Jac graph root node
+profile        {firstname?, lastname?, ..., sso?: {<platform>: {...}}}
+created_at     ISO 8601 timestamp
+updated_at     ISO 8601 timestamp
+```
+
+**Example (sanitized):**
+
+```json
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "active",
+  "role": "user",
+  "identities": [
+    {
+      "type": "email",
+      "value_raw": "user@example.com",
+      "value_normalized": "user@example.com",
+      "verified": false,
+      "is_recovery": true
+    },
+    {
+      "type": "sso",
+      "provider": "google",
+      "external_id": "<google-numeric-id>",
+      "verified": true,
+      "linked_at": "2025-01-15T10:30:00.000000+00:00"
+    }
+  ],
+  "credentials": [
+    {"type": "password", "password_hash": "<bcrypt-hash>"}
+  ],
+  "root_id": "<32-hex-chars>",
+  "profile": {
+    "firstname": "Alice",
+    "lastname": "Doe",
+    "sso": {
+      "google": {
+        "display_name": "Alice Doe",
+        "first_name": "Alice",
+        "last_name": "Doe",
+        "picture": "<google-cdn-picture-url>"
+      }
+    }
+  },
+  "created_at": "2025-01-15T10:30:00.000000+00:00",
+  "updated_at": "2025-01-15T10:30:00.000000+00:00"
+}
+```
+
+**Identity types:**
+
+| Type | Description | Notes |
+|------|-------------|-------|
+| `username` | A unique username | Always verified on creation |
+| `email` | An email address | Marked as recovery identity by default |
+| `sso` | SSO provider link | Added automatically on SSO login; includes `provider` and `external_id` fields |
+
+A user can have at most **one** identity of each non-SSO type (one username, one email). All identity values are normalized (lowercased, stripped) before storage and lookup, preventing case-sensitivity duplicates.
+
+**Credential types:**
+
+| Type | Description |
+|------|-------------|
+| `password` | Bcrypt-hashed password |
+
+Passwords are hashed with [bcrypt](https://en.wikipedia.org/wiki/Bcrypt) (random salt per password). Plain-text passwords never leave the request handler.
+
+### Storage Backends
+
+The identity storage layer is backend-agnostic. jac-scale automatically selects the backend based on your database configuration:
+
+- **SQLite** (default) -- used when no `mongodb_uri` is configured. User data is stored in `.jac/data/users.db` relative to your project root using SQLAlchemy. Good for development and single-instance deployments.
+- **MongoDB** -- used when `mongodb_uri` is set (via `jac.toml` or `MONGODB_URI` environment variable). User data is stored in the `users` collection of the `jac_db` database. Required for multi-instance production deployments.
+
+Both backends implement the same `IdentityStorage` interface. Application code (endpoints, walkers, middleware) is completely unaware of which backend is in use.
+
+```toml
+# jac.toml -- use MongoDB
+[plugins.scale.database]
+mongodb_uri = "mongodb://localhost:27017"
+```
+
+```bash
+# Or via environment variable
+export MONGODB_URI="mongodb://localhost:27017"
+```
+
+When no MongoDB URI is configured, SQLite is used automatically with no additional setup.
+
 ### User Registration
 
 ```bash
 curl -X POST http://localhost:8000/user/register \
   -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "secret"}'
+  -d '{
+    "identities": [
+      {"type": "username", "value": "myuser"},
+      {"type": "email", "value": "user@example.com"}
+    ],
+    "credential": {"type": "password", "password": "secret"},
+    "profile": {"firstname": "Alice", "lastname": "Doe"}
+  }'
 ```
 
+Returns on success (HTTP 201):
+
+```json
+{
+  "ok": true,
+  "data": {
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "message": "User registered successfully"
+  }
+}
+```
+
+Registration does **not** return a token. Use `/user/login` after registration to authenticate.
+
+**Validation rules:**
+
+- At least one identity is required
+- Only `username` and `email` types are accepted
+- No duplicate identity types (e.g., two usernames)
+- Identity values must be unique across all users (checked after normalization)
+- Credential type must be `password` with a non-empty password
+
+**Optional `profile` field** -- attach arbitrary fields like `firstname`, `lastname`, `address`, `postcode`. Bounded for safety:
+
+| Limit | Value |
+|---|---|
+| Max keys | 20 |
+| Max key length | 64 |
+| Max value length | 1024 chars |
+| Max total size (JSON) | 8192 bytes |
+| Allowed value types | `str`, `int`, `float`, `bool` |
+| Key pattern | `^[a-zA-Z][a-zA-Z0-9_]{0,63}$` |
+
+The key pattern blocks MongoDB operator injection (`$where`), dot-path traversal, and JS prototype pollution (`__proto__`). Profile is stored under the `profile` sub-document, never spread into the user-doc root, so a profile key cannot collide with `role` / `user_id` / etc.
+
 ### User Login
+
+Log in with **any** identity (username or email) and a password:
 
 ```bash
 curl -X POST http://localhost:8000/user/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "secret"}'
+  -d '{
+    "identity": {"type": "username", "value": "myuser"},
+    "credential": {"type": "password", "password": "secret"}
+  }'
 ```
 
-Returns:
+Returns on success (HTTP 200):
 
 ```json
 {
-  "access_token": "eyJ...",
-  "token_type": "bearer"
+  "ok": true,
+  "data": {
+    "user_id": "550e8400-...",
+    "token": "eyJ...",
+    "root_id": "a1b2c3d4...",
+    "role": "user"
+  }
 }
+```
+
+The same user can log in with their email instead:
+
+```bash
+curl -X POST http://localhost:8000/user/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identity": {"type": "email", "value": "user@example.com"},
+    "credential": {"type": "password", "password": "secret"}
+  }'
 ```
 
 ### Authenticated Requests
@@ -333,27 +512,159 @@ curl -X POST http://localhost:8000/walker/my_walker \
   -d '{}'
 ```
 
+### Token Refresh
+
+Refresh a JWT token before it expires to get a new token with a fresh expiration window:
+
+```bash
+curl -X POST http://localhost:8000/user/refresh-token \
+  -H "Content-Type: application/json" \
+  -d '{"token": "eyJ..."}'
+```
+
+The `token` value can optionally include the `Bearer` prefix (it will be stripped automatically).
+
+Returns on success:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "token": "eyJ...(new token)...",
+    "message": "Token refreshed successfully"
+  }
+}
+```
+
+Returns HTTP 401 if the token is invalid or expired.
+
+### Password Update
+
+Update the authenticated user's password. Requires the current password for verification:
+
+```bash
+curl -X PUT http://localhost:8000/user/password \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "current_password": "old_secret",
+    "new_password": "new_secret"
+  }'
+```
+
+Returns on success:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "user_id": "550e8400-...",
+    "message": "Password updated successfully"
+  }
+}
+```
+
+Returns HTTP 400 if the current password is incorrect or the new password is empty.
+
 ### JWT Configuration
 
-Configure JWT authentication via environment variables:
+JWT tokens use `user_id` (UUID) as the primary claim, not the username. This means users can change their username or email without invalidating existing tokens.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `JWT_SECRET` | Secret key for JWT signing | `supersecretkey` |
-| `JWT_ALGORITHM` | JWT algorithm | `HS256` |
-| `JWT_EXP_DELTA_DAYS` | Token expiration in days | `7` |
+Configure JWT via `jac.toml` or environment variables:
+
+```toml
+[plugins.scale.jwt]
+secret = "your-secret-key-here"
+algorithm = "HS256"
+exp_delta_days = 7
+```
+
+| Variable | `jac.toml` key | Description | Default |
+|----------|---------------|-------------|---------|
+| `JWT_SECRET` | `secret` | Secret key for JWT signing | `supersecretkey_for_testing_only!` |
+| `JWT_ALGORITHM` | `algorithm` | JWT signing algorithm | `HS256` |
+| `JWT_EXP_DELTA_DAYS` | `exp_delta_days` | Token expiration in days | `7` |
+
+!!! warning "Production: change the JWT secret"
+    The default JWT secret is for development only. In production, set a long, random secret via environment variable or `jac.toml`. Anyone who knows the secret can forge valid tokens for any user.
+
+**JWT claims:**
+
+| Claim | Description |
+|-------|-------------|
+| `user_id` | UUID of the authenticated user |
+| `role` | User role (`admin`, `system`, or `user`) |
+| `exp` | Expiration timestamp |
+| `iat` | Issued-at timestamp |
+
+**Current limitations:**
+
+- No token blacklist or revocation -- tokens remain valid until they expire
+- No refresh token rotation -- the refresh endpoint issues a new token but does not invalidate the old one
+
+### Roles
+
+jac-scale has three built-in roles:
+
+| Role | Value | Description |
+|------|-------|-------------|
+| Admin | `admin` | Full administrative access, including the admin portal |
+| System | `system` | Internal system account (cannot be deleted) |
+| User | `user` | Standard user (default for new registrations) |
+
+Roles are stored in the user document and included in JWT claims. The admin user is bootstrapped automatically on first server start (see [Admin Portal](#admin-portal) for configuration).
+
+**Protected accounts** that cannot be deleted:
+
+- The bootstrap admin (fixed UUID `00000000-0000-0000-0000-000000000000`)
+- System accounts (role `system`)
+- The guest account (identity `__guest__`)
+
+Roles are managed via the admin portal API or programmatically through the `UserManager`:
+
+```bash
+# Set user role via admin API
+curl -X PUT http://localhost:8000/admin/users/{username} \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "admin"}'
+```
 
 ### SSO (Single Sign-On)
 
-jac-scale supports SSO with external identity providers. Currently supported: Google.
+jac-scale supports SSO with **Google**, **Apple**, and **GitHub**. SSO accounts are stored as identities within the user document (type `sso` with a `provider` field), not in a separate collection.
 
-**Configuration:**
+**How SSO login works:**
 
-| Variable | Description |
-|----------|-------------|
-| `SSO_HOST` | SSO callback host URL (default: `http://localhost:8000/sso`) |
-| `SSO_GOOGLE_CLIENT_ID` | Google OAuth client ID |
-| `SSO_GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+1. User is redirected to the provider's login page
+2. Provider calls back with an authorization code
+3. jac-scale exchanges the code for user info (email, external ID, plus optional `display_name`, `first_name`, `last_name`, `picture`)
+4. If a user with that email exists, the SSO identity is linked and a JWT is returned
+5. If no user exists, a new account is created with a verified email identity, the SSO identity is linked, and a JWT is returned
+
+**Profile population.** The optional fields the provider returns (`display_name`, `first_name`, `last_name`, `picture`) are written to `profile.sso.<platform>` on the user record. They are refreshed from the latest provider data on every SSO login, so display names and avatar URLs stay current. Developer-set fields outside the `sso` namespace (e.g. `profile.firstname` set during `/user/register`) are never overwritten by the SSO refresh.
+
+**Configuration via `jac.toml`:**
+
+```toml
+[plugins.scale.sso]
+host = "http://localhost:8000"  # Your server's public URL
+client_auth_callback_url = ""   # Optional: redirect to frontend after SSO
+
+[plugins.scale.sso.google]
+client_id = "your-google-client-id"
+client_secret = "your-google-client-secret"
+
+[plugins.scale.sso.apple]
+client_id = "your-apple-client-id"
+client_secret = "your-apple-client-secret"
+
+[plugins.scale.sso.github]
+client_id = "your-github-client-id"
+client_secret = "your-github-client-secret"
+```
+
+Only providers with both `client_id` and `client_secret` configured are enabled. Unconfigured providers return HTTP 501 with a descriptive message.
 
 **SSO Endpoints:**
 
@@ -361,7 +672,10 @@ jac-scale supports SSO with external identity providers. Currently supported: Go
 |--------|------|-------------|
 | GET | `/sso/{platform}/login` | Redirect to provider login page |
 | GET | `/sso/{platform}/register` | Redirect to provider registration |
-| GET | `/sso/{platform}/login/callback` | OAuth callback handler |
+| GET | `/sso/{platform}/callback` | OAuth callback handler (GET) |
+| POST | `/sso/{platform}/callback` | OAuth callback handler (POST, for Apple Sign In) |
+
+Where `{platform}` is `google`, `apple`, or `github`.
 
 **Frontend Callback Redirect:**
 
@@ -375,16 +689,104 @@ client_auth_callback_url = "http://localhost:3000/auth/callback"
 When set, the callback endpoint redirects to the configured URL with query parameters:
 
 - On success: `{client_auth_callback_url}?token={jwt_token}`
-- On failure: `{client_auth_callback_url}?error={error_message}`
+- On failure: `{client_auth_callback_url}?error={error_code}&message={error_message}`
 
-This enables seamless browser-based OAuth flows where the frontend receives the token via URL parameters.
+**SSO Account Linking/Unlinking:**
+
+SSO accounts can be linked and unlinked programmatically. An SSO identity is automatically linked when a user logs in via SSO. To unlink, use the admin portal API or the `UserManager.unlink_sso_account()` method. Unlinking removes the SSO identity from the user's identity array but does not delete the user account.
 
 **Example:**
 
 ```bash
 # Redirect user to Google login
-curl http://localhost:8000/sso/google/login
+curl -L http://localhost:8000/sso/google/login
+
+# Redirect user to GitHub login
+curl -L http://localhost:8000/sso/github/login
 ```
+
+### Legacy User Migration
+
+If you are upgrading from an older version of jac-scale that used flat username/password user documents, the MongoDB backend automatically migrates legacy users on server startup. This migration:
+
+1. Converts flat `username`/`email`/`password_hash` fields into the identity + credential array format
+2. **Progressively rehashes** old SHA-256 passwords to bcrypt on the next successful login (no user action required)
+3. Handles **case collisions** -- if normalization causes two legacy usernames to collide, the duplicate is marked as `disabled`
+4. Preserves existing `root_id`, `role`, and other fields
+
+The migration runs once during `UserManager` initialization and is idempotent. SQLite deployments do not need migration since they use the new format from the start.
+
+!!! note
+    The legacy SHA-256 migration code is marked as removable. Once all users have logged in at least once (triggering the bcrypt rehash), the migration path can be safely removed in a future release.
+
+### Get Current User
+
+Fetch the authenticated user's profile, identities, role, and metadata. Credentials are never returned.
+
+```bash
+curl http://localhost:8000/user/me \
+  -H "Authorization: Bearer <token>"
+```
+
+Returns (HTTP 200):
+
+```json
+{
+  "ok": true,
+  "data": {
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "role": "user",
+    "status": "active",
+    "identities": [
+      {
+        "type": "email",
+        "value": "user@example.com",
+        "verified": false,
+        "is_recovery": true
+      },
+      {
+        "type": "sso",
+        "provider": "google",
+        "verified": true,
+        "is_recovery": false
+      }
+    ],
+    "profile": {
+      "firstname": "Alice",
+      "lastname": "Doe",
+      "sso": {
+        "google": {
+          "display_name": "Alice Doe",
+          "first_name": "Alice",
+          "last_name": "Doe",
+          "picture": "<google-cdn-picture-url>"
+        }
+      }
+    },
+    "created_at": "2025-01-15T10:30:00.000000+00:00",
+    "updated_at": "2025-01-15T10:30:00.000000+00:00"
+  }
+}
+```
+
+The response strips internal fields (`credentials`, `password_hash`, `value_normalized`, identity `external_id`, `root_id`). For SSO identities, the `provider` is exposed instead of the user-supplied `value`. Use `profile.sso.<platform>.picture` to render an avatar in your UI.
+
+Returns `401 UNAUTHORIZED` for a missing or expired token, `404 NOT_FOUND` if the user has been deleted but the token is still valid.
+
+### Auth Endpoint Summary
+
+| Method | Path | Auth Required | Description |
+|--------|------|--------------|-------------|
+| POST | `/user/register` | No | Create a new user |
+| POST | `/user/login` | No | Authenticate and get JWT |
+| POST | `/user/refresh-token` | No (token in body) | Refresh an existing JWT |
+| GET | `/user/me` | Yes (Bearer) | Get the authenticated user's profile |
+| PUT | `/user/password` | Yes (Bearer) | Update password |
+| GET | `/sso/{platform}/{operation}` | No | Initiate SSO flow |
+| GET/POST | `/sso/{platform}/callback` | No | SSO callback handler |
+| POST | `/api-key/create` | Yes (Bearer) | Create an API key |
+| GET | `/api-key/list` | Yes (Bearer) | List API keys |
+| DELETE | `/api-key/{api_key_id}` | Yes (Bearer) | Revoke an API key |
 
 ---
 
@@ -425,8 +827,10 @@ session_expiry_hours = 24
 | Role | Value | Description |
 |------|-------|-------------|
 | `ADMIN` | `admin` | Full administrative access |
-| `MODERATOR` | `moderator` | Limited administrative access |
+| `SYSTEM` | `system` | Internal system account (cannot be deleted) |
 | `USER` | `user` | Standard user access |
+
+See [Roles](#roles) in the Authentication section for details on protected accounts and role management.
 
 ### Admin API Endpoints
 
@@ -813,6 +1217,8 @@ The `sv import` keyword has two flavors depending on where the importer and the 
 
 In the sv-to-sv flavor, `order_service.jac` doing `sv import from inventory_service { check_stock }` does not load `inventory_service` into the consumer's process. Calling `check_stock(sku)` issues a `POST /function/check_stock` against the inventory service's URL and returns the result. The same source runs unchanged whether `inventory_service` is a separate microservice, a sibling process started by the same `jac start` command, or (when `sv import` is absent) a normal in-process import.
 
+Both `def:pub` functions and `walker:pub` archetypes can cross the boundary. Function imports POST to `/function/<name>` and return the function's value. Walker imports POST to `/walker/<name>` and return the rehydrated walker instance with its `has` fields populated and `reports` attached, so call sites read the result the same way they would after a local spawn. See [Walker Imports](#walker-imports) for the wire shape and ergonomics.
+
 For a step-by-step walkthrough that covers project setup, running both services, and watching the round-trip, see the [Microservices tutorial](../../tutorials/production/microservices.md). The rest of this section is a reference for the discovery rules, wire contract, and plugin override surface.
 
 ### Requirements
@@ -834,13 +1240,59 @@ What works:
 - **`enum` types** -- serialized by name.
 - **Primitives** -- `int`, `float`, `str`, `bool`, `None`, `list[T]`, `dict[K, V]`.
 - **Bidirectional** -- typed function arguments are wrapped on the way out and unwrapped on the way in.
+- **`walker:pub` archetypes** -- when imported by name. The consumer-side stub mirrors the provider's `has` fields, and the round-trip rehydrates the walker into a real instance with `reports` populated. See [Walker Imports](#walker-imports).
 
 What doesn't:
 
-- **Walkers, anchors, closures** -- not wire-friendly. Pass identifiers (e.g. `jid`) and re-resolve on the other side.
+- **Anchors, closures** -- not wire-friendly. Pass identifiers (e.g. `jid`) and re-resolve on the other side.
 - **Live database handles, file handles** -- service-local resources only.
 
-Failures (network errors, missing service, error envelope from the provider) raise `RuntimeError` with a message of the form `sv-to-sv RPC '{module}.{func}' failed: {msg}`.
+Failures (network errors, missing service, error envelope from the provider) raise `RuntimeError`. The message form depends on which kind of symbol was being called:
+
+- Function: `sv-to-sv RPC '{module}.{func}' failed: {msg}`
+- Walker: `sv-to-sv walker spawn '{module}.{walker}' failed: {msg}`
+
+### Walker Imports
+
+A consumer can `sv import` a `walker:pub` archetype the same way it imports a function. The compiler generates a stub class on the consumer side whose name and `has` field shape mirror the provider's walker, so type identity is preserved and the call site reads like a local construction.
+
+```jac
+# notify_service.jac (provider)
+walker:pub Greet {
+    has name: str;
+    can greet with Root entry {
+        report f"hello, {self.name}";
+    }
+}
+
+# dispatcher_service.jac (consumer)
+sv import from notify_service { Greet }
+
+walker:pub TriggerGreet {
+    has who: str;
+    can run with Root entry {
+        rg = Greet(name=self.who);   # POST /walker/Greet on the provider
+        report rg.reports[0];        # "hello, <who>"
+    }
+}
+```
+
+What happens when the consumer evaluates `Greet(name=self.who)`:
+
+1. The stub class collects the keyword arguments into a JSON dict (boundary-typed values are serialized via `_to_wire` first).
+2. The runtime POSTs that dict to `/walker/Greet` on the resolved provider URL using the same dispatch chain as function calls (test client → registry → `JAC_SV_<MOD>_URL` → automatic spawn).
+3. The provider spawns and runs the walker, then returns a `TransportResponse` envelope whose `data.result` is the executed walker as a dict and whose `data.reports` is the list of values it emitted via `report`.
+4. The consumer rehydrates `data.result` into an instance of the local stub class, attaches `data.reports` as the instance's `reports` attribute, and returns it.
+
+The result is a normal walker instance on the consumer: `rg.name`, `rg.reports[0]`, and `isinstance(rg, Greet)` all work. Boundary-typed values inside the walker's `has` fields and inside the `reports` list are unwrapped recursively, so a walker that emits an `obj` type comes back as that type, not as a raw dict.
+
+A few notes:
+
+- **Spawn semantics, not construction.** Locally, `Greet(name="x")` only constructs a walker; you still need `spawn` to run it. Across the boundary, instantiating a sv-imported walker is **spawn-and-execute** -- there is no useful concept of an unexecuted remote walker. The consumer-side class accepts only the `has` fields as keyword arguments and always returns a post-execution instance.
+- **`walker:pub` only.** Private walkers are not exposed as endpoints, so calls into them return 404. Boundary types from a walker's signature (used in `has` fields or referenced in `report` arguments) need to be `sv import`ed alongside the walker.
+- **Same retry, breaker, auth, and tracing as functions.** The plugin override surface is `sv_walker_call`, not `sv_service_call`, but they share the per-provider circuit breaker and `rpc_timeout` config -- a tripped breaker protects either RPC kind. See [Plugin Override: Custom Service Spawning](#plugin-override-custom-service-spawning).
+
+This applies to **sv-to-sv** imports. Walker imports across the **cl-to-sv** boundary (browser calling a server walker) are not currently generated; for cl-to-sv use a `def:pub` wrapper that spawns the walker server-side.
 
 ### Automatic Startup
 
@@ -954,6 +1406,19 @@ Always call `sv_client.clear_test_clients()` between tests to avoid bleed-over f
 The hook is called during automatic startup, once per provider, in parallel up to 8 at a time. Overrides must be idempotent and safe to run concurrently. Both properties were already true of the pre-existing lazy contract (concurrent first-call requests could race into the same hook), so a plugin written against any prior version continues to work without modification.
 
 The default jac-scale implementation at a high level: pick a free loopback port in `18000-18999`, start an HTTP listener on a daemon thread serving the module's `def:pub` endpoints, wait until the listener responds to an HTTP probe, then register the URL. Consult the jac-scale source if you need the exact details; the contract plugin authors should rely on is the `ensure_sv_service` signature and the requirement to call `sv_client.register` before returning.
+
+### Plugin Override: RPC Transport
+
+Two parallel hooks let a plugin own the wire-level transport for sv-to-sv calls:
+
+| Hook | Used by | Default transport |
+|---|---|---|
+| `JacAPIServer.sv_service_call(module_name, func_name, args)` | sv-imported `def:pub` functions | `POST /function/<name>` |
+| `JacAPIServer.sv_walker_call(module_name, walker_name, args, stub_cls)` | sv-imported `walker:pub` archetypes | `POST /walker/<name>` + `stub_cls._from_wire` rehydration |
+
+Plugins typically override both with the same auth-forwarding, tracing, retry, and circuit-breaker policy. The jac-scale plugin does exactly that: walker calls share the per-provider circuit breaker with function calls (both express provider liveness, so a tripped breaker should protect either kind), forward the inbound `Authorization` header, propagate `X-Trace-Id` across the hop, retry transport-level failures with exponential backoff, and respect the per-service `rpc_timeout` config.
+
+Overrides for `sv_walker_call` must end by returning the rehydrated walker instance: call `stub_cls._from_wire(envelope.data.result)` and attach `envelope.data.reports` to the resulting instance's `reports` attribute. The default implementation is a useful reference and reusing `_unwrap_sv_envelope` / `_hydrate_walker_envelope` from the jac-scale source keeps error semantics consistent with the function path.
 
 ## Storage
 
@@ -1217,7 +1682,7 @@ with entry{
 ## Redis Operations
 
 **Common Methods:** `get()`, `set()`, `delete()`, `exists()`
-**Redis Methods:** `set_with_ttl()`, `expire()`, `incr()`, `scan_keys()`
+**Redis Methods:** `set_with_ttl()`, `expire()`, `incr()`, `scan_keys()`, `set_nx_with_ttl()`, `delete_if_equals()`
 
 **Example:**
 
@@ -1238,6 +1703,89 @@ with entry {
 ```
 
 **Note:** Database-specific methods raise `NotImplementedError` on wrong database type.
+
+---
+
+## Distributed Locks (Redis only)
+
+When a jac-scale app runs with multiple replicas behind a load balancer, two pods can land on the same shared resource (an EFS-backed file, an external API rate limit, a row in a downstream database) at the same instant. Python's `threading.Lock` only serializes inside one process, so it cannot prevent the race. The kvstore exposes two primitives that together build a correct cross-pod mutex on top of Redis.
+
+### Acquire: `set_nx_with_ttl(key, value, ttl)`
+
+Atomically sets the key only if it does not already exist, with an automatic expiration. Maps to Redis `SET key value NX EX ttl`. Returns `True` if the caller acquired the lock, `False` if another caller already holds it.
+
+The TTL is mandatory: if the holder crashes without releasing, Redis frees the lock automatically after `ttl` seconds, so an orphan never blocks the cluster forever.
+
+### Release: `delete_if_equals(key, expected_value)`
+
+Atomically deletes the key only when its current value matches `expected_value`. Implemented with a server-side Lua script so the GET and DEL run as one operation. Returns `True` if deleted, `False` otherwise.
+
+Pair `delete_if_equals` with `set_nx_with_ttl` and a unique fence token: a slow holder whose TTL expired during a long operation will not delete a lock another caller has since acquired, since the values no longer match.
+
+### Cross-pod mutex pattern
+
+```jac
+import os;
+import time;
+import from uuid { uuid4 }
+import from jac_scale.lib { kvstore }
+
+glob _kv = kvstore(db_name='myapp', db_type='redis');
+
+def with_repo_lock(repo_id: str, action: str) -> dict {
+    fence = str(uuid4());
+    payload = {'fence': fence, 'pod': os.environ.get('HOSTNAME', 'local')};
+
+    # Acquire: retry up to ~25s, give up if contention persists.
+    deadline = time.time() + 25.0;
+    acquired = False;
+    while time.time() < deadline {
+        if _kv.set_nx_with_ttl(f'repo_lock:{repo_id}', payload, ttl=30) {
+            acquired = True;
+            break;
+        }
+        time.sleep(0.2);
+    }
+    if not acquired {
+        return {'success': False, 'error': 'lock contention timeout'};
+    }
+
+    try {
+        return run_protected_op(repo_id, action);
+    } finally {
+        # Release: compare-and-delete. Safe even if our TTL already expired
+        # and another pod owns the key now; the value mismatch makes it a no-op.
+        _kv.delete_if_equals(f'repo_lock:{repo_id}', payload);
+    }
+}
+```
+
+### Cluster-wide debounce
+
+`set_nx_with_ttl` also collapses N pods running the same periodic task into a single execution per window. No release needed: the TTL is the window length.
+
+```jac
+def maybe_run_periodic_task(task_id: str) -> bool {
+    payload = {'pod': os.environ.get('HOSTNAME', 'local'), 'ts': time.time()};
+    if _kv.set_nx_with_ttl(f'task_dbnce:{task_id}', payload, ttl=60) {
+        run_task(task_id);
+        return True;
+    }
+    return False;  # Another pod already ran it within the last 60s.
+}
+```
+
+This is the right pattern for autosave debouncing, leader-only reconciliation cycles, and any other "exactly once per window across the cluster" requirement.
+
+### When to use which
+
+| Need | Primitive | Release |
+|---|---|---|
+| Mutual exclusion (only one caller in the cluster runs the protected block) | `set_nx_with_ttl` + retry on `False` | `delete_if_equals` with a unique fence token |
+| Debounce (throttle to one execution per window across the cluster) | `set_nx_with_ttl` once, no retry | None: let TTL expire |
+| Leader election (one pod holds a long-lived role) | `set_nx_with_ttl` with renewing TTL | `delete_if_equals` on graceful shutdown |
+
+`set_nx_with_ttl` and `delete_if_equals` raise `NotImplementedError` on MongoDB; distributed-lock semantics require Redis.
 
 ---
 
@@ -1674,22 +2222,31 @@ cpu_utilization_target = 70   # Scale out when average CPU exceeds 70%
 
 ### Persistent Storage
 
-Controls the PersistentVolumeClaim (PVC) size for MongoDB and Redis StatefulSets. The same size applies to both.
+Controls the PersistentVolumeClaim (PVC) sizes for the application code volume, MongoDB, and Redis StatefulSets.
 
-**Default:**
+**Defaults:**
 
-| TOML Key  | Default | Description |
+| TOML Key | Default | Description |
 |----------|---------|-------------|
-| `pvc_size` | `5Gi` | Storage size for each database PVC |
+| `pvc_size` | `5Gi` | Storage size for the application code PVC |
+| `mongodb_storage_size` | `1Gi` | Storage size for the MongoDB data PVC |
 
 **To change in `jac.toml`:**
 
 ```toml
 [plugins.scale.kubernetes]
 pvc_size = "20Gi"
+mongodb_storage_size = "10Gi"
 ```
 
-> **Note:** PVC size cannot be reduced after creation. Increasing it requires deleting and recreating the StatefulSet (data loss). Plan accordingly.
+**MongoDB PVC resize behaviour:**
+
+- **Increase**: Applying a larger `mongodb_storage_size` on redeploy automatically patches the existing PVC. Your stored data is preserved - only the capacity request is updated.
+- **Decrease**: Attempting to set a smaller value than the current PVC size raises an explicit error and aborts the deploy. Shrinking a PVC is not supported by Kubernetes.
+- **No change**: If the value matches the current size, no action is taken.
+
+> **Note:** MongoDB PVC resize requires the cluster's StorageClass to have `allowVolumeExpansion: true`. Most cloud providers (AWS EBS, GCE PD, Azure Disk) and MicroK8s enable this by default. Verify with `kubectl get storageclass`.
+> **Note:** `pvc_size` (application code PVC) cannot be changed after creation - it is created once and never resized.
 
 ---
 
@@ -2458,7 +3015,7 @@ type = "local"
 **How it works:**
 
 - Allocates a port pair from a pool (base ports 5180-5200, stride of 2)
-- Runs `jac start main.jac --dev -p {port}` as a child process
+- Runs `jac start --dev -p {port}` as a child process
 - Checks for readiness by scanning process output for `"Server ready"`
 - Returns `http://localhost:{port}` as the preview URL
 
@@ -2494,7 +3051,7 @@ network_isolation = true
 
 - Creates a Docker container from `base_image`
 - Copies project files into `/app` via tarball injection
-- Runs `jac install && jac start main.jac --dev -p 8000`
+- Runs `jac install && jac start --dev -p 8000`
 - Applies resource limits (memory, CPU, storage)
 - Optionally creates an isolated Docker bridge network per sandbox
 - Polls container health via HTTP until ready (120s timeout)
@@ -2535,7 +3092,7 @@ security_context = true
 2. Provisions RBAC (ServiceAccount, Role, RoleBinding) for pod management
 3. Packages project files into a ConfigMap (text files in `data`, binary files in `binaryData` as base64)
 4. Creates a pod with an init container that unpacks the ConfigMap into `/app`
-5. Main container runs `jac install && jac start main.jac --dev -p 8000`
+5. Main container runs `jac install && jac start --dev -p 8000`
 6. Creates a Service and Ingress (unless `proxy_mode = true`)
 7. Polls pod readiness (container ready + "Server ready" in logs, 120s timeout)
 8. Returns the preview URL

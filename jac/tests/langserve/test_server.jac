@@ -196,16 +196,52 @@ test "test_go_to_definition" {
     }
 }
 
+test "test_go_to_definition_any_keyword" {
+    setup_test();
+    try {
+        lsp = create_server();
+        f = uris.from_fs_path(fixture_path("any_goto_def_tests.jac"));
+        lsp.type_check_file(f);
+
+        # Backtick-escaped `` `any `` (function form) → typeshed builtins.pyi
+        bt_any = str(lsp.get_definition(f, lspt.Position(1, 13)));
+        assert "builtins.pyi" in bt_any , f"Unexpected: {bt_any}";
+
+        # Bare `any` keyword in type annotation → typeshed typing.pyi (Any)
+        bare_any = str(lsp.get_definition(f, lspt.Position(4, 8)));
+        assert "typing.pyi" in bare_any , f"Unexpected: {bare_any}";
+
+        # Bare `Any` without import → unresolved (not in jac_builtins.pyi __all__)
+        bare_Any = lsp.get_definition(f, lspt.Position(5, 8));
+        assert bare_Any is None , f"Expected None, got: {bare_Any}";
+
+        # Bare `final` without import → same — guards __all__ discipline.
+        bare_final = lsp.get_definition(f, lspt.Position(6, 8));
+        assert bare_final is None , f"Expected None, got: {bare_final}";
+    } finally {
+        teardown_test();
+    }
+}
+
 test "test_go_to_definition_method_manual_impl" {
     setup_test();
     try {
         lsp = create_server("");
         decldef_file = uris.from_fs_path(
-            examples_abs_path("micro/decl_defs_main.impl.jac")
+            os.path.join(
+                JAC_ROOT,
+                "tests",
+                "compiler",
+                "fixtures",
+                "micro",
+                "decl_defs_main.impl.jac"
+            )
         );
         lsp.type_check_file(decldef_file);
         decldef_main_file = uris.from_fs_path(
-            examples_abs_path("micro/decl_defs_main.jac")
+            os.path.join(
+                JAC_ROOT, "tests", "compiler", "fixtures", "micro", "decl_defs_main.jac"
+            )
         );
         lsp.type_check_file(decldef_main_file);
         lsp.type_check_file(decldef_file);
@@ -250,6 +286,23 @@ test "test_go_to_definition_md_path" {
             );
             assert expected in result , f"Line {line}, char {char}: expected '{expected}' in '{result}'";
         }
+    } finally {
+        teardown_test();
+    }
+}
+
+test "test_go_to_definition_jsx_component" {
+    setup_test();
+    try {
+        lsp = create_server();
+        jsx_file = uris.from_fs_path(fixture_path("jsx_goto_def.cl.jac"));
+        lsp.type_check_file(jsx_file);
+        # Cursor inside the <MyButton ...> tag name on line 11 (0-indexed 10).
+        # `        <MyButton ...` -- 'M' is at column 9, so col 12 lands on 'u'.
+        result = str(lsp.get_definition(jsx_file, lspt.Position(10, 12)));
+        # Expect to land on the MyButton function declaration on line 3
+        # (0-indexed 2): `def MyButton(...` -- 'MyButton' spans cols 4-12.
+        assert "jsx_goto_def.cl.jac:2:4-2:12" in result , f"Unexpected go-to-def result for JSX tag: {result}";
     } finally {
         teardown_test();
     }

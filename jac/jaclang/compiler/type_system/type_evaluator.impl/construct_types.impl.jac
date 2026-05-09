@@ -1,3 +1,13 @@
+"""Return the effective type of root."""
+impl TypeEvaluator._get_type_of_root(node_: uni.SpecialVarRef) -> TypeBase {
+    if self.prefetch and self.prefetch.root_class {
+        node_.sym = self.prefetch.root_class.get_class_symbol();
+        node_.type = self.prefetch.root_class.clone_as_instance();
+        return node_.type;
+    }
+    return types.UnknownType();
+}
+
 """Return the effective type of self."""
 impl TypeEvaluator._get_type_of_self(node_: uni.SpecialVarRef) -> TypeBase {
     if method := self._get_enclosing_method(node_) {
@@ -326,6 +336,24 @@ impl TypeEvaluator.get_type_of_class(node_: uni.Archetype) -> types.ClassType {
     );
     is_builtin_class = mod_flags.is_builtin_stub;
     is_from_stdlib_stub = mod_flags.is_stdlib_stub;
+    # Add implicit base classes for Jac archetype keywords.
+    # walker Foo {} → base_classes = [Walker]  (so .reports etc. are visible)
+    # node Foo {}   → base_classes = [Node]
+    if not base_classes and self.prefetch {
+        if (
+            node_.sym_category == SymbolType.WALKER_ARCH
+            and self.prefetch.walker_class
+            and not (is_builtin_class and node_.name_spec.sym_name == "Walker")
+        ) {
+            base_classes.append(self.prefetch.walker_class);
+        } elif (
+            node_.sym_category == SymbolType.NODE_ARCH
+            and self.prefetch.node_class
+            and not (is_builtin_class and node_.name_spec.sym_name == "Node")
+        ) {
+            base_classes.append(self.prefetch.node_class);
+        }
+    }
     # Add object as implicit base class (Every class inherits from object)
     if not base_classes and self.prefetch and self.prefetch.object_class {
         is_object_class = is_builtin_class and node_.name_spec.sym_name == "object";
@@ -390,12 +418,23 @@ impl TypeEvaluator.get_type_of_enum(node_: uni.Enum) -> types.ClassType {
     }
     # Collect base classes (Example: enum Color(IntEnum) → base_classes = [IntEnum])
     base_classes: list[types.TypeBase] = [];
+    # Typed-base shorthand `enum X: T { ... }` desugars to `class X(T, Enum)`
+    # for type-system purposes. T flows in as a leading base so the MRO carries
+    # both T and Enum — feeding get_special_enum_value_type_from_bases for the
+    # int/str shortcuts and exposing the mixin parent's attributes for custom
+    # variants. Mutually exclusive with parenthesized `enum X(B) { ... }`.
+    if node_.value_type {
+        base_classes.append(self.get_type_of_expression(node_.value_type));
+    }
     for base_class in node_.base_classes or [] {
         base_class_type = self.get_type_of_expression(base_class);
         base_classes.append(base_class_type);
     }
-    # No base specified, Then add Enum as implicit base (Example: enum Color { RED=1 } → base_classes = [Enum])
-    if not base_classes and self.prefetch and self.prefetch.enum_class {
+    # Plain `enum X { ... }` and typed `enum X: T { ... }` both get an
+    # implicit Enum base (matching what codegen emits as the trailing kind).
+    # `enum X(B) { ... }` does NOT — the user is responsible for inheriting
+    # from Enum themselves.
+    if not node_.base_classes and self.prefetch and self.prefetch.enum_class {
         base_classes.append(self.prefetch.enum_class);
     }
     # Get required value type for special enums (IntEnum → int, StrEnum → str, IntFlag → int)
