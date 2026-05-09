@@ -99,9 +99,19 @@ impl JacScaleUserManager.authenticate(
 }
 
 impl JacScaleUserManager.get_root_id(username: str) -> (str | None) {
-    return self._storage.get_root_id(username)
+    import time;
+    now = time.time();
+    cached = _root_id_cache.get(username);
+    if cached and (now - float(cached[1])) < 300 {
+        return str(cached[0]);
+    }
+    root_id = self._storage.get_root_id(username)
         if self._storage
         else super.get_root_id(username);
+    if root_id {
+        _root_id_cache[username] = (root_id, now);
+    }
+    return root_id;
 }
 
 impl JacScaleUserManager.get_user(username: str) -> (dict[(str, str)] | None) {
@@ -171,8 +181,7 @@ impl JacScaleUserManager.get_jwt_claims(token: str) -> (dict | None) {
 impl JacScaleUserManager.validate_jwt_token(token: str) -> (str | None) {
     try {
         decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM]);
-        username = decoded['username'];
-        return username if self.user_exists(username) else None;
+        return decoded.get('username');
     } except Exception as e {
         logger.debug(f"Failed to validate JWT token: {str(e)}");
         return None;

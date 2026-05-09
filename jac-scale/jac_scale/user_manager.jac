@@ -19,7 +19,8 @@ glob _jwt_config = get_scale_config().get_jwt_config(),
      JWT_ALGORITHM = _jwt_config['algorithm'],
      JWT_EXP_DELTA_DAYS = _jwt_config['exp_delta_days'],
      SSO_HOST = _sso_config['host'],
-     logger = logging.getLogger(__name__);
+     logger = logging.getLogger(__name__),
+     _root_id_cache: dict = {};  # {username: (root_id, timestamp)}, 300s TTL
 
 """User roles enum."""
 enum UserRole {
