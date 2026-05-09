@@ -8,7 +8,10 @@ impl RedisBackend.postinit -> None {
     if self.redis_url {
         if 'redis_client' not in _process_cache {
             try {
-                _process_cache['redis_client'] = redis.from_url(self.redis_url);
+                max_conn = _get_db_config().get('redis_max_connections', 20);
+                _process_cache['redis_client'] = redis.from_url(
+                    self.redis_url, max_connections=max_conn
+                );
             } except Exception as e {
                 logger.warning(f"Redis connection failed: {e}");
             }
