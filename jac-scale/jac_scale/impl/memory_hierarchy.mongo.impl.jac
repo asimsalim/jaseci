@@ -86,7 +86,7 @@ impl MongoBackend.put(anchor: Anchor) -> None {
         data = Serializer.serialize(anchor, include_type=True);
         new_hash = Serializer._compute_hash(anchor);
         old_hash = anchor.hash;
-        if old_hash is not None {
+        if old_hash {
             result = self.collection.update_one(
                 {'_id': str(_id), '_hash': old_hash},
                 {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}}
