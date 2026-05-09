@@ -5,38 +5,38 @@ impl RedisBackend.postinit -> None {
     if self.redis_url is None {
         self.redis_url = _get_db_config().get('redis_url');
     }
-    if self.redis_url and self.redis_client is None {
-        try {
-            self.redis_client = redis.from_url(self.redis_url);
-        } except Exception as e {
-            logger.warning(f"Redis connection failed: {e}");
-            self.redis_client = None;
+    if self.redis_url {
+        if 'redis_client' not in _process_cache {
+            try {
+                _process_cache['redis_client'] = redis.from_url(self.redis_url);
+            } except Exception as e {
+                logger.warning(f"Redis connection failed: {e}");
+            }
         }
+        self.redis_client = _process_cache.get('redis_client');
     }
 }
 
 """Check if Redis is available and connected."""
 impl RedisBackend.is_available -> bool {
+    if 'redis_available' in _process_cache {
+        return _process_cache['redis_available'];
+    }
     if not self.redis_url {
         self.redis_url = _get_db_config().get('redis_url');
     }
-    if not self.redis_url {
+    if not self.redis_url or self.redis_client is None {
+        _process_cache['redis_available'] = False;
         return False;
     }
-    client = None;
     try {
-        client = redis.from_url(self.redis_url);
-        client.ping();
+        self.redis_client.ping();
+        _process_cache['redis_available'] = True;
         return True;
     } except Exception as e {
         logger.debug(f"Redis availability check failed: {e}");
+        _process_cache['redis_available'] = False;
         return False;
-    } finally {
-        if client {
-            try {
-                client.close();
-            } except Exception { }
-        }
     }
 }
 
@@ -99,14 +99,8 @@ impl RedisBackend.delete(id: UUID) -> None {
 
 """Close Redis connection."""
 impl RedisBackend.close -> None {
-    if self.redis_client {
-        try {
-            self.redis_client.close();
-        } except Exception as e {
-            logger.warning(f"Error closing Redis connection: {e}");
-        }
-        self.redis_client = None;
-    }
+    # Don't close the shared process-level client; just drop local reference.
+    self.redis_client = None;
 }
 
 """Check if an anchor is in the cache."""
