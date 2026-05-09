@@ -89,7 +89,13 @@ impl MongoBackend.put(anchor: Anchor) -> None {
         if old_hash {
             result = self.collection.update_one(
                 {'_id': str(_id), '_hash': old_hash},
-                {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}}
+                {
+                    '$set': {
+                        'data': data,
+                        'type': type(anchor).__name__,
+                        '_hash': new_hash
+                    }
+                }
             );
             if result.matched_count == 0 {
                 logger.warning(
@@ -100,7 +106,13 @@ impl MongoBackend.put(anchor: Anchor) -> None {
         } else {
             self.collection.update_one(
                 {'_id': str(_id)},
-                {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}},
+                {
+                    '$set': {
+                        'data': data,
+                        'type': type(anchor).__name__,
+                        '_hash': new_hash
+                    }
+                },
                 upsert=True
             );
         }
@@ -259,14 +271,26 @@ impl MongoBackend.bulk_put(anchors: Iterable[Anchor]) -> None {
                 ops.append(
                     UpdateOne(
                         {'_id': str(_id), '_hash': old_hash},
-                        {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}}
+                        {
+                            '$set': {
+                                'data': data,
+                                'type': type(anchor).__name__,
+                                '_hash': new_hash
+                            }
+                        }
                     )
                 );
             } else {
                 ops.append(
                     UpdateOne(
                         {'_id': str(_id)},
-                        {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}},
+                        {
+                            '$set': {
+                                'data': data,
+                                'type': type(anchor).__name__,
+                                '_hash': new_hash
+                            }
+                        },
                         upsert=True
                     )
                 );

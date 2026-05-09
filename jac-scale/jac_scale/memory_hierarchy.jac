@@ -29,12 +29,11 @@ import from jaclang.runtimelib.serializer { Serializer }
 import from jac_scale.config_loader { get_scale_config }
 import from jaclang { JacRuntimeInterface as Jac }
 
-glob logger = logging.getLogger(__name__);
-
-# Process-level singletons shared across all requests in a single server process.
-# A single dict so cross-module mutation works without global declarations in each package.
-# Keys: 'mongo_client', 'redis_client', 'mongo_available', 'redis_available', 'system_root'
-glob _process_cache: dict[str, Any] = {};
+glob logger = logging.getLogger(__name__),
+     # Process-level singletons shared across all requests in a single server process.
+     # A single dict so cross-module mutation works without global declarations in each package.
+     # Keys: 'mongo_client', 'redis_client', 'mongo_available', 'redis_available', 'system_root'
+     _process_cache: dict[str, Any] = {};
 
 """Get fresh database config to support dynamic env var changes (e.g., testcontainers)."""
 def _get_db_config -> dict {

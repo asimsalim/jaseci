@@ -342,7 +342,9 @@ impl JacScaleScheduler._execute_task(
         JacRuntime.set_request_context(ctx);
         try {
             if is_walker {
-                result = self._server.execution_manager.spawn_walker(target, {}, username);
+                result = self._server.execution_manager.spawn_walker(
+                    target, {}, username
+                );
             } else {
                 result = self._server.execution_manager.execute_function(
                     target, {}, username

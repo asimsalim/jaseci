@@ -1,6 +1,6 @@
 """Execution context for Jac Language."""
 
-import from asyncio { Queue }
+import from queue { Queue }
 import from contextvars { ContextVar }
 import from dataclasses { MISSING }
 import from typing { Any, cast }

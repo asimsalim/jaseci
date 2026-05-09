@@ -329,22 +329,21 @@ impl JacScaleUserManager.sso_callback(
                 },
                 meta=Meta(extra={'http_status': 200})
             );
-        } else {
-            # User does not exist — register then login
-            result = self.create_user(email, generate_random_password());
-            if 'error' in result {
-                return TransportResponse.fail(
-                    code='USER_CREATION_FAILED',
-                    message=result.get('error', 'User creation failed'),
-                    meta=Meta(extra={'http_status': 400})
-                );
-            }
-            result['token'] = self.create_jwt_token(email);
-            result['platform'] = platform;
-            return TransportResponse.success(
-                data=result, meta=Meta(extra={'http_status': 201})
+        }
+        # User does not exist - register then login
+        result = self.create_user(email, generate_random_password());
+        if 'error' in result {
+            return TransportResponse.fail(
+                code='USER_CREATION_FAILED',
+                message=result.get('error', 'User creation failed'),
+                meta=Meta(extra={'http_status': 400})
             );
         }
+        result['token'] = self.create_jwt_token(email);
+        result['platform'] = platform;
+        return TransportResponse.success(
+            data=result, meta=Meta(extra={'http_status': 201})
+        );
     } except Exception as e {
         return TransportResponse.fail(
             code='AUTHENTICATION_FAILED',
@@ -353,6 +352,7 @@ impl JacScaleUserManager.sso_callback(
         );
     }
 }
+
 
 # ============================================================================
 # SSO Account Linking - delegate to storage or SQLite

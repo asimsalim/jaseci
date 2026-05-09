@@ -241,12 +241,11 @@ impl ExecutionManager.execute_function(
         reports = self.report_collector(call_state);
         if isgenerator(reports) or isinstance(reports, AsyncGenerator) {
             return reports;
-        } else {
-            return {
-                'result': Serializer.serialize(result, api_mode=True),
-                'reports': Serializer.serialize(reports, api_mode=True)
-            };
         }
+        return {
+            'result': Serializer.serialize(result, api_mode=True),
+            'reports': Serializer.serialize(reports, api_mode=True)
+        };
     } except Exception as e {
         return {'error': str(e)};
     } finally {
@@ -305,12 +304,11 @@ impl ExecutionManager.spawn_walker(
         reports = self.report_collector(call_state);
         if isgenerator(reports) or isinstance(reports, AsyncGenerator) {
             return reports;
-        } else {
-            return {
-                'result': Serializer.serialize(result, api_mode=True),
-                'reports': Serializer.serialize(reports, api_mode=True)
-            };
         }
+        return {
+            'result': Serializer.serialize(result, api_mode=True),
+            'reports': Serializer.serialize(reports, api_mode=True)
+        };
     } except Exception as e {
         import traceback;
         return {'error': str(e), 'traceback': traceback.format_exc()};
@@ -1297,7 +1295,10 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
         }
 
         """Authenticate and render a page, sending HTML response."""
-        def _render_page(self: JacRequestHandler, func_name: str, args: dict = {}) {
+        def _render_page(
+            self: JacRequestHandler, func_name: str, args: dict | None = None
+        ) {
+            args = args or {};
             username = self._authenticate();
             if not username {
                 username = Con.GUEST.value;
@@ -1635,7 +1636,9 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                     }
                 }
                 fields = data | {'_jac_spawn_node': node_id};
-                response = server.execution_handler.spawn_walker(name, fields, username);
+                response = server.execution_handler.spawn_walker(
+                    name, fields, username
+                );
                 self._send_response(response);
             } elif (path == '/cl/__error__') {
                 message = data.get('message', '');
