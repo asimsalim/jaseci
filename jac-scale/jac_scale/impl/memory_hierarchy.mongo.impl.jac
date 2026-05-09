@@ -62,6 +62,12 @@ impl MongoBackend.get(id: UUID) -> (Anchor | None) {
         db_obj = self.collection.find_one({'_id': str(_id)});
         if db_obj {
             anchor = self._load_anchor(db_obj);
+            if anchor {
+                stored_hash = db_obj.get('_hash');
+                if stored_hash is not None {
+                    anchor.hash = stored_hash;
+                }
+            }
             return anchor;
         }
     } except Exception as e {
@@ -70,7 +76,7 @@ impl MongoBackend.get(id: UUID) -> (Anchor | None) {
     return None;
 }
 
-"""Store anchor in MongoDB."""
+"""Store anchor in MongoDB with CAS to prevent last-writer-wins overwrites."""
 impl MongoBackend.put(anchor: Anchor) -> None {
     if self.client is None or not anchor.persistent {
         return;
@@ -78,12 +84,27 @@ impl MongoBackend.put(anchor: Anchor) -> None {
     _id = to_uuid(anchor.id);
     try {
         data = Serializer.serialize(anchor, include_type=True);
-        self.collection.update_one(
-            {'_id': str(_id)},
-            {'$set': {'data': data, 'type': type(anchor).__name__}},
-            upsert=True
-        );
-        anchor.hash = Serializer._compute_hash(anchor);
+        new_hash = Serializer._compute_hash(anchor);
+        old_hash = anchor.hash;
+        if old_hash is not None {
+            result = self.collection.update_one(
+                {'_id': str(_id), '_hash': old_hash},
+                {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}}
+            );
+            if result.matched_count == 0 {
+                logger.warning(
+                    f"CAS conflict on anchor {_id}: concurrent modification detected, discarding stale update"
+                );
+                return;
+            }
+        } else {
+            self.collection.update_one(
+                {'_id': str(_id)},
+                {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}},
+                upsert=True
+            );
+        }
+        anchor.hash = new_hash;
     } except Exception as e {
         logger.error(f"MongoDB put failed: {e}");
     }
@@ -218,7 +239,7 @@ impl MongoBackend.sync -> None {
     }
 }
 
-"""Bulk store multiple anchors."""
+"""Bulk store multiple anchors with CAS for existing documents."""
 impl MongoBackend.bulk_put(anchors: Iterable[Anchor]) -> None {
     if self.client is None {
         return;
@@ -231,20 +252,32 @@ impl MongoBackend.bulk_put(anchors: Iterable[Anchor]) -> None {
         _id = to_uuid(anchor.id);
         try {
             data = Serializer.serialize(anchor, include_type=True);
-            ops.append(
-                UpdateOne(
-                    {'_id': str(_id)},
-                    {'$set': {'data': data, 'type': type(anchor).__name__}},
-                    upsert=True
-                )
-            );
+            new_hash = Serializer._compute_hash(anchor);
+            old_hash = anchor.hash;
+            if old_hash {
+                # CAS: only overwrite if stored hash matches our last-read version
+                ops.append(
+                    UpdateOne(
+                        {'_id': str(_id), '_hash': old_hash},
+                        {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}}
+                    )
+                );
+            } else {
+                ops.append(
+                    UpdateOne(
+                        {'_id': str(_id)},
+                        {'$set': {'data': data, 'type': type(anchor).__name__, '_hash': new_hash}},
+                        upsert=True
+                    )
+                );
+            }
         } except Exception as e {
             logger.debug(f"MongoDB bulk_put serialization failed: {e}");
         }
     }
     if ops {
         try {
-            self.collection.bulk_write(ops);
+            self.collection.bulk_write(ops, ordered=False);
         } except Exception as e {
             logger.debug(f"MongoDB bulk_write failed: {e}");
         }
@@ -262,6 +295,10 @@ impl MongoBackend.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
         for doc in self.collection.find({'_id': {'$in': str_ids}}) {
             if (anchor := self._load_anchor(doc)) {
                 anchor.is_updated = False;
+                stored_hash = doc.get('_hash');
+                if stored_hash is not None {
+                    anchor.hash = stored_hash;
+                }
                 result[UUID(doc['_id'])] = anchor;
             }
         }
