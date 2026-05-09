@@ -100,10 +100,12 @@ impl ScaleTieredMemory.commit(anchor: (Anchor | None) = None) -> None {
     }
 }
 
-"""Batch get with tiered read-through: check L1, then batch L3 misses, promote all."""
+"""Batch get: L1 → L2 (Redis mget) → L3 (MongoDB $in) with batch L3→L2 promotion."""
 impl ScaleTieredMemory.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
     result: dict[UUID, Anchor] = {};
     missing_ids: list[UUID] = [];
+
+    # L1 check (in-process memory, always first)
     for id in ids {
         if (anchor := self.__mem__.get(id)) {
             result[id] = anchor;
@@ -111,26 +113,64 @@ impl ScaleTieredMemory.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
             missing_ids.append(id);
         }
     }
-    if missing_ids and self.l3 {
-        # Use batch_get if L3 supports it (MongoBackend), fall back to get() (SqliteMemory)
+    if not missing_ids {
+        return result;
+    }
+
+    # L2 check (Redis mget — single round-trip for all missing ids)
+    l3_missing_ids: list[UUID] = list(missing_ids);
+    if self.l2 and hasattr(self.l2, 'batch_get') {
+        l2_results: dict[UUID, Anchor] = {};
+        try {
+            l2_results = self.l2.batch_get(missing_ids);
+        } except Exception as e {
+            logger.debug(f"L2 batch_get failed, falling through to L3: {e}");
+        }
+        if l2_results {
+            l3_missing_ids = [];
+            for id in missing_ids {
+                if id in l2_results {
+                    a2 = l2_results[id];
+                    self.__mem__[id] = a2;
+                    result[id] = a2;
+                } else {
+                    l3_missing_ids.append(id);
+                }
+            }
+        }
+    }
+
+    # L3 check (MongoDB $in query — single round-trip for all remaining ids)
+    if l3_missing_ids and self.l3 {
         l3_results: dict[UUID, Anchor] = {};
         if hasattr(self.l3, 'batch_get') {
-            l3_results = self.l3.batch_get(missing_ids);
+            l3_results = self.l3.batch_get(l3_missing_ids);
         } else {
-            for mid in missing_ids {
+            for mid in l3_missing_ids {
                 if (a := self.l3.get(mid)) {
                     l3_results[mid] = a;
                 }
             }
         }
-        for (id, anchor) in l3_results.items() {
-            self.__mem__[id] = anchor;
+        if l3_results {
+            # Promote all L3 hits to L2 in a single pipeline when available
             if self.l2 {
                 try {
-                    self.l2.put(anchor);
-                } except Exception { }
+                    if hasattr(self.l2, 'batch_put') {
+                        self.l2.batch_put(list(l3_results.values()));
+                    } else {
+                        for a3 in l3_results.values() {
+                            self.l2.put(a3);
+                        }
+                    }
+                } except Exception as e {
+                    logger.debug(f"L2 batch promotion failed: {e}");
+                }
             }
-            result[id] = anchor;
+            for (id, anchor) in l3_results.items() {
+                self.__mem__[id] = anchor;
+                result[id] = anchor;
+            }
         }
     }
     return result;

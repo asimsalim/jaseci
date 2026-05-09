@@ -186,17 +186,17 @@ impl MongoBackend.commit(anchor: (Anchor | None) = None) -> None {
 }
 
 # PersistentMemory-specific methods
-"""Sync - flush L1 memory to MongoDB (only changed anchors)."""
+"""Sync - flush L1 memory to MongoDB using bulk_write (single round-trip)."""
 impl MongoBackend.sync -> None {
     import from jaclang { JacRuntimeInterface as Jac }
     if not self._mem_ref or not self.client {
         return;
     }
+    dirty: list = [];
     for (_, anchor) in list(self._mem_ref.items()) {
         if not anchor.persistent {
             continue;
         }
-        # Check hash first — skip unchanged anchors without access check
         current_hash = Serializer._compute_hash(anchor);
         if current_hash == anchor.hash {
             continue;
@@ -204,10 +204,16 @@ impl MongoBackend.sync -> None {
         if not Jac.check_write_access(anchor) {
             continue;
         }
+        dirty.append(anchor);
+    }
+    if dirty {
         try {
-            self.put(anchor);
+            self.bulk_put(dirty);
+            for anchor in dirty {
+                anchor.hash = Serializer._compute_hash(anchor);
+            }
         } except Exception as e {
-            logger.warning(f"MongoDB sync failed for anchor {anchor.id}: {e}");
+            logger.warning(f"MongoDB sync bulk_put failed: {e}");
         }
     }
 }
