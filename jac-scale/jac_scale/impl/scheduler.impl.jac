@@ -315,7 +315,8 @@ impl JacScaleScheduler.delete_job(job_id: str) -> bool {
 impl JacScaleScheduler._execute_task(
     name: str, username: str, is_walker: bool
 ) -> None {
-    import asyncio;
+    import from jaclang { JacRuntimeInterface as Jac }
+    import from jaclang.jac0core.runtime { JacRuntime }
     label = 'walker' if is_walker else 'function';
     try {
         if self._server is None {
@@ -335,32 +336,26 @@ impl JacScaleScheduler._execute_task(
         target = registry[name];
         logger.debug(f"Executing scheduled {label} '{name}' as '{username}'");
 
-        async def _run {
+        # Create a fresh execution context for each job so L1 starts empty
+        # and changes are committed and discarded when the job ends.
+        ctx = Jac.create_j_context(user_root=None);
+        JacRuntime.set_request_context(ctx);
+        try {
             if is_walker {
-                result = await self._server.execution_manager.spawn_walker(
-                    target, {}, username
-                );
+                result = self._server.execution_manager.spawn_walker(target, {}, username);
             } else {
-                result = await self._server.execution_manager.execute_function(
+                result = self._server.execution_manager.execute_function(
                     target, {}, username
                 );
             }
+            ctx.mem.commit();
             if isinstance(result, dict) and 'error' in result {
                 logger.error(
                     f"Scheduled {label} '{name}' error: {result.get('error')}"
                 );
             }
-        }
-
-        try {
-            loop = asyncio.get_event_loop();
-            if loop.is_running() {
-                asyncio.ensure_future(_run());
-            } else {
-                loop.run_until_complete(_run());
-            }
-        } except RuntimeError {
-            asyncio.run(_run());
+        } finally {
+            JacRuntime.clear_request_context();
         }
     } except Exception as e {
         logger.error(f"Error executing {label} '{name}': {e}");
