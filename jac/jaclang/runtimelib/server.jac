@@ -117,7 +117,7 @@ obj ExecutionManager {
     has base_path: str,
         user_manager: UserManager;
 
-    def execute_function(
+    async def execute_function(
         func: Callable[(..., Any)], args: dict[(str, Any)], username: str
     ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
@@ -129,7 +129,7 @@ obj ExecutionManager {
         func: Callable[(..., Any)], args: dict[(str, Any)], username: str
     ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
-    def spawn_walker(
+    async def spawn_walker(
         walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
     ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
@@ -247,11 +247,11 @@ obj ExecutionHandler {
         execution_manager: ExecutionManager,
         user_manager: UserManager;
 
-    def call_function(
+    async def call_function(
         name: str, args: dict[(str, Any)], username: str
     ) -> TransportResponse;
 
-    def spawn_walker(
+    async def spawn_walker(
         name: str, fields: dict[(str, Any)], username: str
     ) -> TransportResponse;
 }

@@ -507,7 +507,7 @@ impl ExecutionManager.spawn_walker_async(
         }
         spawn_result = Jac.spawn(`walker, target_node);
         if iscoroutine(spawn_result) {
-            result = asyncio.run(spawn_result);
+            result = await spawn_result;
         } else {
             result = spawn_result;
         }
@@ -1419,8 +1419,9 @@ impl ExecutionHandler.call_function(
             meta=Meta(extra={'http_status': 404})
         );
     }
-    result = self.execution_manager.execute_function(functions[name], args, username);
-    Jac.commit();
+    result = await self.execution_manager.execute_function(
+        functions[name], args, username
+    );
     return TransportResponse.success(
         data=result, meta=Meta(extra={'http_status': 200})
     );
@@ -1440,8 +1441,7 @@ impl ExecutionHandler.spawn_walker(
             meta=Meta(extra={'http_status': 404})
         );
     }
-    result = self.execution_manager.spawn_walker(walkers[name], fields, username);
-    Jac.commit();
+    result = await self.execution_manager.spawn_walker(walkers[name], fields, username);
     return TransportResponse.success(
         data=result, meta=Meta(extra={'http_status': 200})
     );
@@ -1525,10 +1525,7 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
         }
 
         """Authenticate and render a page, sending HTML response."""
-        def _render_page(
-            self: JacRequestHandler, func_name: str, args: dict | None = None
-        ) {
-            args = args or {};
+        def _render_page(self: JacRequestHandler, func_name: str, args: dict = {}) {
             username = self._authenticate();
             if not username {
                 username = Con.GUEST.value;
@@ -1872,7 +1869,9 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                         }
                     }
                 }
-                response = server.execution_handler.call_function(name, data, username);
+                response = asyncio.run(
+                    server.execution_handler.call_function(name, data, username)
+                );
                 self._send_response(response);
             } elif path.startswith('/walker/') {
                 name_parts = path.split('/');
@@ -1897,8 +1896,8 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                     }
                 }
                 fields = data | {'_jac_spawn_node': node_id};
-                response = server.execution_handler.spawn_walker(
-                    name, fields, username
+                response = asyncio.run(
+                    server.execution_handler.spawn_walker(name, fields, username)
                 );
                 self._send_response(response);
             } elif (path == '/cl/__error__') {
