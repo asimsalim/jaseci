@@ -186,13 +186,12 @@ impl UserManager.close -> None {
     }
 }
 
-"""Collect reports from function, spawn execution asynchronously."""
+"""Collect reports from the call-state queue (synchronous, blocking drain)."""
 impl ExecutionManager.report_collector(call_state: CallState) -> dict[str, JsonValue] {
     final_reports = [];
     while True {
-        report_item = await call_state.reports.get();
+        report_item = call_state.reports.get();
         if report_item is call_state._sentinel {
-            call_state.reports.task_done();
             return final_reports;
         } elif isgenerator(report_item) or isinstance(report_item, AsyncGenerator) {
             return report_item;
@@ -206,6 +205,7 @@ impl ExecutionManager.report_collector(call_state: CallState) -> dict[str, JsonV
 impl ExecutionManager.execute_function(
     func: Callable[(..., Any)], args: dict[(str, Any)], username: str
 ) -> dict[str, JsonValue] {
+    import asyncio;
     root_id = self.user_manager.get_root_id(username);
     if not root_id {
         return {'error': 'User not found'};
@@ -233,13 +233,12 @@ impl ExecutionManager.execute_function(
         }
         func_result = func(**args);
         if iscoroutine(func_result) {
-            result = await func_result;
+            result = asyncio.run(func_result);
         } else {
             result = func_result;
         }
         call_state.reports.put_nowait(call_state._sentinel);
-        reports = await self.report_collector(call_state);
-        Jac.commit();
+        reports = self.report_collector(call_state);
         if isgenerator(reports) or isinstance(reports, AsyncGenerator) {
             return reports;
         } else {
@@ -255,24 +254,11 @@ impl ExecutionManager.execute_function(
     }
 }
 
-"""Spawn a walker in user's context.
-
-When JAC_WALKER_OFFLOAD=1 is set, the entire critical section (auth
-lookup, target node resolution, walker body execution, async coroutine
-resolution, report drain, commit) runs on a worker thread via
-asyncio.to_thread so the uvicorn event loop stays free. Default path
-is byte-identical to the original implementation.
-"""
+"""Spawn a walker in user's context."""
 impl ExecutionManager.spawn_walker(
     walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
 ) -> dict[str, JsonValue] {
-    import os;
-    if os.environ.get('JAC_WALKER_OFFLOAD') {
-        import asyncio;
-        return await asyncio.to_thread(
-            self._spawn_walker_offloaded, walker_cls, fields, username
-        );
-    }
+    import asyncio;
     import from jaclang.jac0core.constructs { NodeArchetype }
     root_id = self.user_manager.get_root_id(username);
     if not root_id {
@@ -310,15 +296,13 @@ impl ExecutionManager.spawn_walker(
             target_node = ctx.get_root();
         }
         spawn_result = Jac.spawn(`walker, target_node);
-        # Handle async walkers - await the coroutine if spawn returns one
         if iscoroutine(spawn_result) {
-            result = await spawn_result;
+            result = asyncio.run(spawn_result);
         } else {
             result = spawn_result;
         }
         call_state.reports.put_nowait(call_state._sentinel);
-        reports = await self.report_collector(call_state);
-        Jac.commit();  # Persist changes
+        reports = self.report_collector(call_state);
         if isgenerator(reports) or isinstance(reports, AsyncGenerator) {
             return reports;
         } else {
@@ -331,79 +315,6 @@ impl ExecutionManager.spawn_walker(
         import traceback;
         return {'error': str(e), 'traceback': traceback.format_exc()};
     } finally {
-        ctx.call_state.reset(call_token);
-    }
-}
-
-"""Sync helper that runs the full spawn_walker critical section on a
-worker thread when JAC_WALKER_OFFLOAD=1 is set. Owns its own event loop
-so it can resolve async walker coroutines and the async report_collector
-without reaching back to the uvicorn main loop.
-"""
-impl ExecutionManager._spawn_walker_offloaded(
-    walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
-) -> dict[str, JsonValue] {
-    import from jaclang.jac0core.constructs { NodeArchetype }
-    import asyncio;
-    root_id = self.user_manager.get_root_id(username);
-    if not root_id {
-        return {'error': 'User not found'};
-    }
-    target_node_id = fields.pop('_jac_spawn_node', None);
-    for (k, v) in list(fields.items()) {
-        if isinstance(v, dict) and '__type__' in v {
-            deserialized = Serializer.deserialize(v);
-            if deserialized is not None {
-                fields[k] = deserialized;
-            }
-        } elif isinstance(v, list) {
-            fields[k] = [
-                Serializer.deserialize(item)
-                    if isinstance(item, dict) and '__type__' in item
-                    else item for item in v
-            ];
-        }
-    }
-    ctx = Jac.get_context();
-    ctx.set_user_root(root_id);
-    call_token = ctx.call_state.set(CallState());
-    call_state = ctx.call_state.get();
-    # Dedicated event loop for this worker thread. Used to await async
-    # walker coroutines and the async report_collector without touching
-    # the uvicorn main loop.
-    loop = asyncio.new_event_loop();
-    try {
-        `walker = walker_cls(**fields);
-        if target_node_id {
-            target_node = Jac.get_object(target_node_id);
-            if not isinstance(target_node, NodeArchetype) {
-                return {'error': f"Invalid target node: {target_node_id}"};
-            }
-        } else {
-            target_node = ctx.get_root();
-        }
-        spawn_result = Jac.spawn(`walker, target_node);
-        if iscoroutine(spawn_result) {
-            result = loop.run_until_complete(spawn_result);
-        } else {
-            result = spawn_result;
-        }
-        call_state.reports.put_nowait(call_state._sentinel);
-        reports = loop.run_until_complete(self.report_collector(call_state));
-        Jac.commit();
-        if isgenerator(reports) or isinstance(reports, AsyncGenerator) {
-            return reports;
-        } else {
-            return {
-                'result': Serializer.serialize(result, api_mode=True),
-                'reports': Serializer.serialize(reports, api_mode=True)
-            };
-        }
-    } except Exception as e {
-        import traceback;
-        return {'error': str(e), 'traceback': traceback.format_exc()};
-    } finally {
-        loop.close();
         ctx.call_state.reset(call_token);
     }
 }
@@ -1281,9 +1192,8 @@ impl ExecutionHandler.call_function(
             meta=Meta(extra={'http_status': 404})
         );
     }
-    result = await self.execution_manager.execute_function(
-        functions[name], args, username
-    );
+    result = self.execution_manager.execute_function(functions[name], args, username);
+    Jac.commit();
     return TransportResponse.success(
         data=result, meta=Meta(extra={'http_status': 200})
     );
@@ -1302,7 +1212,8 @@ impl ExecutionHandler.spawn_walker(
             meta=Meta(extra={'http_status': 404})
         );
     }
-    result = await self.execution_manager.spawn_walker(walkers[name], fields, username);
+    result = self.execution_manager.spawn_walker(walkers[name], fields, username);
+    Jac.commit();
     return TransportResponse.success(
         data=result, meta=Meta(extra={'http_status': 200})
     );
@@ -1699,9 +1610,7 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                         }
                     }
                 }
-                response = asyncio.run(
-                    server.execution_handler.call_function(name, data, username)
-                );
+                response = server.execution_handler.call_function(name, data, username);
                 self._send_response(response);
             } elif path.startswith('/walker/') {
                 name_parts = path.split('/');
@@ -1726,9 +1635,7 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                     }
                 }
                 fields = data | {'_jac_spawn_node': node_id};
-                response = asyncio.run(
-                    server.execution_handler.spawn_walker(name, fields, username)
-                );
+                response = server.execution_handler.spawn_walker(name, fields, username);
                 self._send_response(response);
             } elif (path == '/cl/__error__') {
                 message = data.get('message', '');

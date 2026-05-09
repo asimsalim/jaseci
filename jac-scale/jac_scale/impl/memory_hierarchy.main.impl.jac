@@ -139,9 +139,7 @@ impl ScaleTieredMemory.batch_get(ids: list[UUID]) -> dict[UUID, Anchor] {
 """Close all backends."""
 impl ScaleTieredMemory.close -> None {
     self.commit();
-    # Sync and close L3 persistence
     if self.l3 {
-        self.l3.sync();
         self.l3.close();
     }
     # Close L2 cache
