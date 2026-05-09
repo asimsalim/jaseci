@@ -341,8 +341,13 @@ impl MongoBackend.delete(id: UUID) -> None {
     }
 }
 
-"""Flush pending writes and close MongoDB connection."""
+"""Flush pending writes and release local reference to the shared client."""
 impl MongoBackend.close -> None {
+    try {
+        self.sync();
+    } except Exception as e {
+        logger.warning(f"MongoBackend.close sync failed: {e}");
+    }
     # Don't close the shared process-level client; just drop local reference.
     self.client = None;
     self._mem_ref = None;
