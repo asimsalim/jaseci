@@ -75,16 +75,18 @@ test "ensure_indexes creates arch_type compound index (IXSCAN not COLLSCAN)" {
     );
 
     # Insert a dummy doc and verify the query planner uses the index
-    backend.collection.insert_one({
-        '_id': str(uuid4()),
-        'arch_type': '_QUser',
-        'type': 'NodeAnchor',
-        'arch_module': __name__,
-        'fingerprint': None,
-        'data': {'archetype': {'name': 'Alice', 'age': 25}},
-        'format_version': 1,
-        'updated_at': '2026-01-01T00:00:00Z'
-    });
+    backend.collection.insert_one(
+        {
+            '_id': str(uuid4()),
+            'arch_type': '_QUser',
+            'type': 'NodeAnchor',
+            'arch_module': __name__,
+            'fingerprint': None,
+            'data': {'archetype': {'name': 'Alice', 'age': 25}},
+            'format_version': 1,
+            'updated_at': '2026-01-01T00:00:00Z'
+        }
+    );
 
     plan = backend.collection.find(
         {'arch_type': '_QUser', 'type': 'NodeAnchor'}
@@ -102,9 +104,7 @@ test "ensure_indexes creates arch_type compound index (IXSCAN not COLLSCAN)" {
         return False;
     }
 
-    assert _has_ixscan(plan) , (
-        f"Expected IXSCAN on arch_type query but got: {plan}"
-    );
+    assert _has_ixscan(plan) , (f"Expected IXSCAN on arch_type query but got: {plan}");
 }
 
 
@@ -141,9 +141,7 @@ test "query_by_type returns only anchors of the specified archetype" {
         # Fresh backend so L1 is empty — reads must come from MongoDB
         backend2 = MongoBackend(mongo_url=uri, db_name=db);
         found = list(backend2.query_by_type('_QUser'));
-        assert len(found) == 3 , (
-            f"Expected 3 _QUser anchors, got {len(found)}"
-        );
+        assert len(found) == 3 , (f"Expected 3 _QUser anchors, got {len(found)}");
         for a in found {
             assert type(a.archetype).__name__ == '_QUser' , (
                 f"Unexpected archetype type: {type(a.archetype).__name__}"
@@ -258,9 +256,7 @@ test "get_roots uses indexed filter, not full collection scan" {
             return False;
         }
 
-        assert _has_ixscan(plan) , (
-            f"get_roots query should use IXSCAN, got: {plan}"
-        );
+        assert _has_ixscan(plan) , (f"get_roots query should use IXSCAN, got: {plan}");
     } finally {
         JacRuntime.set_base_path(orig_base);
     }

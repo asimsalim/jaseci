@@ -56,9 +56,7 @@ impl MongoBackend.ensure_indexes -> None {
         background=True
     );
     self.collection.create_index(
-        [('updated_at', DESCENDING)],
-        name='updated_at_-1',
-        background=True
+        [('updated_at', DESCENDING)], name='updated_at_-1', background=True
     );
 }
 
@@ -398,8 +396,7 @@ impl MongoBackend.`has(id: UUID) -> bool {
 
 """Query all anchors with optional filter."""
 impl MongoBackend.query(
-    filter: (Callable[[Anchor], bool] | None) = None,
-    mongo_filter: (dict | None) = None
+    filter: (Callable[[Anchor], bool] | None) = None, mongo_filter: (dict | None) = None
 ) -> Generator[Anchor, None, None] {
     if self.client is None {
         return;
@@ -421,7 +418,9 @@ impl MongoBackend.query(
 impl MongoBackend.get_roots -> Generator[Root, None, None] {
     if self.client is not None {
         try {
-            for doc in self.collection.find({'arch_type': 'Root', 'type': 'NodeAnchor'}) {
+            for doc in self.collection.find(
+                {'arch_type': 'Root', 'type': 'NodeAnchor'}
+            ) {
                 if (anchor := self._load_anchor(doc)) {
                     if isinstance(anchor.archetype, Root) {
                         yield cast(Root, anchor.archetype);
@@ -445,8 +444,7 @@ Example:
     for anchor in backend.query_by_type('User', {'age': {'$lt': 28}}) { ... }
 """
 impl MongoBackend.query_by_type(
-    arch_type_name: str,
-    mongo_filter: (dict | None) = None
+    arch_type_name: str, mongo_filter: (dict | None) = None
 ) -> Generator[Anchor, None, None] {
     if self.client is not None {
         filter_dict: dict = {'arch_type': arch_type_name};
