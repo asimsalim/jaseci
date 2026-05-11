@@ -113,10 +113,17 @@ obj MongoBackend(PersistentMemory) {
     def close -> None;
     def `has(id: UUID) -> bool;
     def query(
-        filter: (Callable[[Anchor], bool] | None) = None
+        filter: (Callable[[Anchor], bool] | None) = None,
+        mongo_filter: (dict | None) = None
     ) -> Generator[Anchor, None, None];
 
     def get_roots -> Generator[Root, None, None];
+    def query_by_type(
+        arch_type_name: str,
+        mongo_filter: (dict | None) = None
+    ) -> Generator[Anchor, None, None];
+
+    def ensure_indexes -> None;
     def find(
         ids: (UUID | Iterable[UUID]), filter: (Callable[[Anchor], Anchor] | None) = None
     ) -> Generator[Anchor, None, None];

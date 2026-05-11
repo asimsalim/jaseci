@@ -33,7 +33,33 @@ impl MongoBackend.postinit -> None {
         } except Exception as e {
             logger.debug(f"MongoBackend: alias preload skipped: {e}");
         }
+        try {
+            self.ensure_indexes();
+        } except Exception as e {
+            logger.debug(f"MongoBackend: index creation skipped: {e}");
+        }
     }
+}
+
+"""Create indexes that make type-based and field-level queries efficient.
+
+Called once at startup. MongoDB's create_index is idempotent.
+"""
+impl MongoBackend.ensure_indexes -> None {
+    if self.collection is None {
+        return;
+    }
+    import from pymongo { ASCENDING, DESCENDING }
+    self.collection.create_index(
+        [('arch_type', ASCENDING), ('type', ASCENDING)],
+        name='arch_type_1_type_1',
+        background=True
+    );
+    self.collection.create_index(
+        [('updated_at', DESCENDING)],
+        name='updated_at_-1',
+        background=True
+    );
 }
 
 """Get the `_quarantine` companion collection."""
@@ -372,13 +398,14 @@ impl MongoBackend.`has(id: UUID) -> bool {
 
 """Query all anchors with optional filter."""
 impl MongoBackend.query(
-    filter: (Callable[[Anchor], bool] | None) = None
+    filter: (Callable[[Anchor], bool] | None) = None,
+    mongo_filter: (dict | None) = None
 ) -> Generator[Anchor, None, None] {
     if self.client is None {
         return;
     }
     try {
-        for doc in self.collection.find() {
+        for doc in self.collection.find(mongo_filter or {}) {
             if (anchor := self._load_anchor(doc)) {
                 if filter is None or filter(anchor) {
                     yield anchor;
@@ -390,11 +417,52 @@ impl MongoBackend.query(
     }
 }
 
-"""Get all root anchors."""
+"""Get all root anchors using an indexed type filter (no full collection scan)."""
 impl MongoBackend.get_roots -> Generator[Root, None, None] {
-    for anchor in self.query() {
-        if isinstance(anchor.archetype, Root) {
-            yield cast(Root, anchor.archetype);
+    if self.client is not None {
+        try {
+            for doc in self.collection.find({'arch_type': 'Root', 'type': 'NodeAnchor'}) {
+                if (anchor := self._load_anchor(doc)) {
+                    if isinstance(anchor.archetype, Root) {
+                        yield cast(Root, anchor.archetype);
+                    }
+                }
+            }
+        } except Exception as e {
+            logger.debug(f"MongoDB get_roots failed: {e}");
+        }
+    }
+}
+
+"""Query anchors by archetype type with optional field-level filter pushed to MongoDB.
+
+arch_type_name: the archetype class name (e.g. 'User', 'Lead').
+mongo_filter: optional dict of archetype field predicates using MongoDB operators.
+              Field names are bare (e.g. {'age': {'$lt': 28}}) and are auto-prefixed
+              to 'data.archetype.*' before being sent to MongoDB.
+
+Example:
+    for anchor in backend.query_by_type('User', {'age': {'$lt': 28}}) { ... }
+"""
+impl MongoBackend.query_by_type(
+    arch_type_name: str,
+    mongo_filter: (dict | None) = None
+) -> Generator[Anchor, None, None] {
+    if self.client is not None {
+        filter_dict: dict = {'arch_type': arch_type_name};
+        if mongo_filter {
+            for (k, v) in mongo_filter.items() {
+                filter_dict[f'data.archetype.{k}'] = v;
+            }
+        }
+        try {
+            for doc in self.collection.find(filter_dict) {
+                if (anchor := self._load_anchor(doc)) {
+                    yield anchor;
+                }
+            }
+        } except Exception as e {
+            logger.debug(f"MongoDB query_by_type({arch_type_name}) failed: {e}");
         }
     }
 }
