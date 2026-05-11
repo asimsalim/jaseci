@@ -13,7 +13,6 @@ Only emitted when all predicates are simple (field op constant). Complex
 conditions — method calls, nested expressions — keep the plain lambda so
 behaviour is unchanged.
 """
-
 obj FilterSpec {
     has type_name: str,
         predicates: dict[str, Any],

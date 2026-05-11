@@ -1459,7 +1459,7 @@ impl JacBasics.refs(
         import from jaclang.jac0core.filter_spec { FilterSpec as _FS }
         if isinstance(post_filter, _FS) and len(path.destinations) == 1 {
             ctx = JacRuntimeInterface.get_context();
-            l3 = getattr(ctx.mem, 'l3', None);
+            l3 = ctx.mem?.l3;
             # Duck-type: any l3 backend with query_by_type gets the pushdown
             if l3 is None {
                 import from jaclang.runtimelib.memory { TieredMemory }
